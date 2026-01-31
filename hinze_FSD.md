@@ -216,7 +216,93 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 {"event": "audio_ready"}
 ```
 
+## 11. Development & Debugging
+
+### 11.1 Build Environment
+- **IDE**: PlatformIO (VS Code extension or CLI)
+- **Framework**: Arduino
+- **Board**: `lolin_s3_mini` (compatible with ESP32-S3 SuperMini)
+
+### 11.2 USB Connection
+The ESP32-S3 SuperMini uses native USB with CDC (Communications Device Class):
+- **Linux**: Appears as `/dev/ttyACM0`
+- **Windows**: COM port (install ESP32-S3 USB driver if needed)
+- **macOS**: `/dev/cu.usbmodem*`
+
+### 11.3 PlatformIO Commands
+```bash
+# Build firmware
+pio run
+
+# Upload to device
+pio run -t upload
+
+# Monitor serial output (interactive terminal required)
+pio device monitor
+
+# Build + Upload + Monitor
+pio run -t upload -t monitor
+
+# Clean build files
+pio run -t clean
+
+# List connected devices
+pio device list
+```
+
+### 11.4 Serial Monitor Settings
+- **Baud Rate**: 115200
+- **Line Ending**: Newline (LF)
+- **Encoding**: UTF-8
+
+### 11.5 Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Device not detected | Check USB cable (must support data, not charge-only) |
+| Upload fails | Hold BOOT button while pressing RST, then release |
+| No serial output | Verify `monitor_speed = 115200` in platformio.ini |
+| I2C device not found | Check wiring, verify pullup resistors (4.7kΩ) |
+| I2S no audio | Verify WS/BCK/DATA connections, check sample rate |
+
+### 11.6 Debug Output Format
+The firmware outputs initialization status on boot:
+```
+=================================
+  Hinze Robot Companion v0.1
+  ESP32-S3 SuperMini
+=================================
+[INIT] Setting up I2C...
+[I2C] Scanning...
+[I2C] Device found at 0x3C (OLED)
+[I2C] 1 device(s) found
+[INIT] Setting up I2S audio...
+[I2S] Microphone configured
+[I2S] Amplifier configured
+[INIT] Setting up servos...
+[SERVO] Pan on GPIO 1, Tilt on GPIO 2
+[INIT] Setting up LED...
+[LED] WS2812 on GPIO 48
+[INIT] Setting up button...
+[BUTTON] Input on GPIO 0 (active low)
+[INIT] Setup complete!
+```
+
+### 11.7 platformio.ini Configuration
+```ini
+[env:esp32-s3-supermini]
+platform = espressif32
+board = lolin_s3_mini
+framework = arduino
+
+monitor_speed = 115200
+
+build_flags =
+    -DARDUINO_USB_MODE=1
+    -DARDUINO_USB_CDC_ON_BOOT=1
+```
+
 ---
-*Document Version: 1.0*
+*Document Version: 1.1*
 *Created: 2026-01-31*
 *Last Updated: 2026-01-31*
