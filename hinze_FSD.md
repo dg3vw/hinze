@@ -58,7 +58,7 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 ### 3.4 User Input
 | Function | GPIO | Component |
 |----------|------|-----------|
-| BUTTON | 0 | Activation button (active low, internal pullup) |
+| BUTTON | 10 | Activation button (active low, internal pullup) |
 
 ## 4. Communication
 
@@ -123,6 +123,12 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 | Always Listening | Continuous speech detection | Quick response, demo mode |
 | Button Press | GPIO 0 button triggers listening | Battery saving, controlled |
 
+### 6.1 Button Behavior
+- **GPIO**: 10 (active low, internal pullup)
+- **Debounce**: Software debounce (~50ms)
+- **Short Press**: Trigger listening mode (Idle → Listening)
+- **Detection**: Interrupt-based for responsive input
+
 ## 7. Functional Requirements
 
 ### 7.1 Voice Interaction
@@ -132,10 +138,11 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 - [ ] Play audio through MAX98357A I2S amplifier
 
 ### 7.2 Emotion Display
-- [ ] Display animated eye graphics on OLED
-- [ ] Support 10 emotion states with smooth transitions
-- [ ] LED color/pattern mapping to emotions
-- [ ] Frame-based animation at 10-15 FPS
+- [x] Display animated eye graphics on OLED
+- [x] Support 10 emotion states with unique eye styles
+- [x] LED color/pattern mapping to emotions
+- [x] Frame-based animation at ~30 FPS
+- [x] Button input to cycle through emotions (GPIO 1)
 
 ### 7.3 Head Movement
 - [ ] Pan servo control (left/right, 0-180°)
@@ -168,25 +175,40 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 └────────────────┘
 ```
 
-### 8.3 Animation Frames per Emotion
-| Emotion | Frames | Animation |
-|---------|--------|-----------|
-| Idle | 4 | Slow blink cycle |
-| Listening | 2 | Wide open, slight pulse |
-| Thinking | 3 | Eyes roll up, dots appear |
-| Happy | 3 | Eyes curve into ^ ^ shape |
-| Sad | 2 | Droopy with tear drop |
-| Angry | 2 | Narrowed, angled down |
-| Surprised | 2 | Maximum open, round |
-| Confused | 3 | Asymmetric, one raised |
-| Sleepy | 4 | Gradual closing, Z's |
-| Excited | 4 | Sparkle effect, bouncy |
+### 8.3 Idle State (Natural Eye Behavior)
+The idle state features lifelike eye animation:
+- **Looking Around**: Pupils move randomly to different positions (left, right, up, down, center)
+- **Natural Blinking**: Random blink interval (2-6 seconds), quick close/open cycle
+- **Smooth Transitions**: Pupil position changes smoothly, not instant jumps
+
+```
+Idle Animation Cycle:
+┌─────────────────────────────────────────────────────────┐
+│  [Look center] → [pause 1-3s] → [Look random dir]       │
+│       ↑                              ↓                  │
+│       └──── [Blink] ←── [pause 2-6s] ←──────────────────│
+└─────────────────────────────────────────────────────────┘
+```
+
+### 8.4 Implemented Eye Animations
+| Emotion | Eye Style | Animation Effect |
+|---------|-----------|------------------|
+| Idle | Round eyes with pupils | Look around randomly + natural blink (2-6s interval) |
+| Listening | Wide open, larger eyes | Subtle size pulse |
+| Thinking | Squinted, pupils up-left | Animated dots "..." appearing |
+| Happy | Curved ^ ^ anime style | Static happy expression |
+| Sad | Droopy eyes + sad brows | Falling tear drop animation |
+| Angry | Narrow eyes + angled brows | Intense static glare |
+| Surprised | Very wide, tiny pupils | Raised eyebrows above eyes |
+| Confused | Asymmetric (one raised) | Question mark "?" displayed |
+| Sleepy | Half-closed slit eyes | Floating "Zzz" animation |
+| Excited | Large bouncy eyes | Sparkle effects + vertical bounce |
 
 ## 9. Emotion States
 
 | # | Emotion | OLED Eyes | LED Color | Head Position |
 |---|---------|-----------|-----------|---------------|
-| 1 | Idle | Neutral eyes, slow blink | Dim white | Center |
+| 1 | Idle | Look around + natural blink | Rainbow cycle | Center |
 | 2 | Listening | Wide open eyes | Blue pulse | Slight tilt toward sound |
 | 3 | Thinking | Squinted eyes, dots | Yellow pulse | Look up-left |
 | 4 | Happy | Curved smile eyes (^ ^) | Green | Gentle nod |
@@ -195,11 +217,44 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 | 7 | Surprised | Very wide, raised brows | White flash | Quick tilt back |
 | 8 | Confused | One raised brow, tilted | Purple | Head tilt |
 | 9 | Sleepy | Half-closed, yawn | Dim orange | Slow droop down |
-| 10 | Excited | Sparkle eyes, bouncy | Rainbow cycle | Quick nods |
+| 10 | Excited | Sparkle eyes, bouncy | Rainbow fast | Quick nods |
 
-## 10. JSON Command Protocol
+## 10. WS2812 LED Behavior
 
-### 10.1 Commands (Host → ESP32)
+### 10.1 LED Modes
+| Mode | Description | Speed |
+|------|-------------|-------|
+| Solid | Static single color | - |
+| Pulse | Fade in/out | 1-2 Hz |
+| Rainbow Cycle | Smooth hue rotation through full spectrum | ~5 sec/cycle |
+| Rainbow Fast | Quick hue rotation | ~1 sec/cycle |
+| Flash | Quick on/off burst | 100ms |
+
+### 10.2 Idle Rainbow Cycle
+```
+Hue rotation: 0° → 360° (Red → Yellow → Green → Cyan → Blue → Magenta → Red)
+Cycle time: ~5 seconds for full spectrum
+Brightness: 50% (not distracting)
+Update rate: 20-30 FPS for smooth transition
+```
+
+### 10.3 Emotion-to-LED Mapping
+| Emotion | LED Mode | Color/Hue |
+|---------|----------|-----------|
+| Idle | Rainbow Cycle | Full spectrum |
+| Listening | Pulse | Blue (240°) |
+| Thinking | Pulse | Yellow (60°) |
+| Happy | Solid | Green (120°) |
+| Sad | Solid | Blue (240°) |
+| Angry | Solid | Red (0°) |
+| Surprised | Flash | White |
+| Confused | Solid | Purple (280°) |
+| Sleepy | Solid | Dim Orange (30°) |
+| Excited | Rainbow Fast | Full spectrum |
+
+## 11. JSON Command Protocol
+
+### 11.1 Commands (Host → ESP32)
 ```json
 {"cmd": "emotion", "state": "happy"}
 {"cmd": "audio_start", "sample_rate": 16000}
@@ -209,27 +264,27 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 {"cmd": "status"}
 ```
 
-### 10.2 Responses (ESP32 → Host)
+### 11.2 Responses (ESP32 → Host)
 ```json
 {"status": "ok", "emotion": "idle", "listening": false}
 {"event": "button_press"}
 {"event": "audio_ready"}
 ```
 
-## 11. Development & Debugging
+## 12. Development & Debugging
 
-### 11.1 Build Environment
+### 12.1 Build Environment
 - **IDE**: PlatformIO (VS Code extension or CLI)
 - **Framework**: Arduino
 - **Board**: `lolin_s3_mini` (compatible with ESP32-S3 SuperMini)
 
-### 11.2 USB Connection
+### 12.2 USB Connection
 The ESP32-S3 SuperMini uses native USB with CDC (Communications Device Class):
 - **Linux**: Appears as `/dev/ttyACM0`
 - **Windows**: COM port (install ESP32-S3 USB driver if needed)
 - **macOS**: `/dev/cu.usbmodem*`
 
-### 11.3 PlatformIO Commands
+### 12.3 PlatformIO Commands
 ```bash
 # Build firmware
 pio run
@@ -250,12 +305,12 @@ pio run -t clean
 pio device list
 ```
 
-### 11.4 Serial Monitor Settings
+### 12.4 Serial Monitor Settings
 - **Baud Rate**: 115200
 - **Line Ending**: Newline (LF)
 - **Encoding**: UTF-8
 
-### 11.5 Troubleshooting
+### 12.5 Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
@@ -265,7 +320,7 @@ pio device list
 | I2C device not found | Check wiring, verify pullup resistors (4.7kΩ) |
 | I2S no audio | Verify WS/BCK/DATA connections, check sample rate |
 
-### 11.6 Debug Output Format
+### 12.6 Debug Output Format
 The firmware outputs initialization status on boot:
 ```
 =================================
@@ -288,7 +343,7 @@ The firmware outputs initialization status on boot:
 [INIT] Setup complete!
 ```
 
-### 11.7 platformio.ini Configuration
+### 12.7 platformio.ini Configuration
 ```ini
 [env:esp32-s3-supermini]
 platform = espressif32
