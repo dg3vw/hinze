@@ -3,7 +3,7 @@
 ## Project Overview
 Interactive robot companion with ESP32-S3, featuring voice interaction via host PC (Whisper/Claude/Piper), emotional OLED eyes, head movement, and LED feedback.
 
-## Current State (2026-01-31)
+## Current State (2026-02-01)
 
 ### Completed
 - [x] Functional Specification Document (hinze_FSD.md)
@@ -12,8 +12,12 @@ Interactive robot companion with ESP32-S3, featuring voice interaction via host 
 - [x] GitHub repository created: https://github.com/dg3vw/hinze
 - [x] OLED eye animations - 10 unique emotion styles
 - [x] WS2812 LED - Rainbow cycle idle + emotion colors
-- [x] Button interrupt with debounce (GPIO 1)
+- [x] TTP223 touch sensor with debounce (GPIO 10)
 - [x] Idle behavior: random look-around + natural blink
+- [x] I2S microphone input (INMP441)
+- [x] Serial JSON command parser
+- [x] Audio streaming protocol (binary packets)
+- [x] Python host application skeleton
 
 ### Hardware Verified
 | Component | Status | Notes |
@@ -21,13 +25,13 @@ Interactive robot companion with ESP32-S3, featuring voice interaction via host 
 | ESP32-S3 SuperMini | Working | USB CDC on /dev/ttyACM0 or ACM1 |
 | SSD1306 OLED | Working | I2C 0x3C, animated eyes displayed |
 | WS2812 LED | Working | Rainbow cycle + emotion colors |
-| Button | Working | GPIO 10, interrupt-based, cycles emotions |
-| INMP441 Mic | Configured | I2S port 0, not yet tested audio |
-| MAX98357A Amp | Configured | I2S port 1, not yet tested audio |
+| TTP223 Touch | Working | GPIO 10, active HIGH, triggers recording |
+| INMP441 Mic | Implemented | I2S port 0, 16kHz 16-bit, needs testing |
+| MAX98357A Amp | Configured | I2S output, not yet implemented |
 | SG90 Servos | Pins set | GPIO 1 (pan), GPIO 2 (tilt), not yet integrated |
 
 ### Firmware Version
-**v0.3** - Full emotion display system
+**v0.4** - I2S Microphone + Serial Commands
 
 ## Pin Reference (Quick)
 ```
@@ -35,8 +39,31 @@ I2S:    WS=4, BCK=5, DIN=6 (mic), DOUT=7 (amp)
 I2C:    SDA=8, SCL=9
 Servo:  Pan=1, Tilt=2
 LED:    WS2812=48
-Button: GPIO 10 (active low)
+Touch:  TTP223=GPIO 10 (active HIGH)
 ```
+
+## Serial Protocol
+
+### Host -> ESP32 (JSON commands)
+```json
+{"cmd":"emotion","state":"happy"}     // Set emotion
+{"cmd":"status"}                       // Request status
+{"cmd":"record_start"}                 // Start recording
+{"cmd":"record_stop"}                  // Stop recording
+```
+
+### ESP32 -> Host (JSON events)
+```json
+{"event":"ready"}                      // Firmware initialized
+{"event":"button","action":"press"}    // Button pressed
+{"event":"audio_start"}                // Recording started
+{"event":"audio_end"}                  // Recording stopped
+```
+
+### Audio Packets (ESP32 -> Host)
+Binary format: `[0xAA][0x55][len_high][len_low][pcm_data...]`
+- 16-bit signed PCM, little-endian
+- 16kHz sample rate
 
 ## Implemented Emotions
 | # | Emotion | Eyes | LED |
@@ -55,18 +82,29 @@ Button: GPIO 10 (active low)
 ## Next Steps
 1. ~~Add OLED display library and test eye graphics~~ (done)
 2. ~~Add WS2812 LED library and test colors~~ (done)
-3. Add servo library and test head movement
-4. Implement serial command parser (JSON)
-5. Test I2S microphone audio capture
-6. Test I2S amplifier audio playback
-7. Create Python host application skeleton
+3. ~~Implement serial command parser (JSON)~~ (done)
+4. ~~Add I2S microphone capture~~ (done)
+5. ~~Create Python host application skeleton~~ (done)
+6. Test I2S microphone audio capture end-to-end
+7. Test Python host with Whisper transcription
+8. Test Claude API integration
+9. Add I2S amplifier audio playback
+10. Add servo library and test head movement
 
 ## Build Commands
 ```bash
-pio run                    # Build
-pio run -t upload          # Flash
+pio run                    # Build firmware
+pio run -t upload          # Flash to ESP32
 pio device monitor         # Serial monitor (needs terminal)
 pio run -t upload -t monitor  # All-in-one
+```
+
+## Host Application
+```bash
+cd host
+pip install -r requirements.txt
+cp config.py config_local.py  # Edit with your API key
+python hinze_host.py          # Run host application
 ```
 
 ## Repository
@@ -77,3 +115,6 @@ pio run -t upload -t monitor  # All-in-one
 - `hinze_FSD.md` - Full specification document
 - `src/main.cpp` - ESP32 firmware entry point
 - `platformio.ini` - Build configuration
+- `host/hinze_host.py` - Python host application
+- `host/config.py` - Host configuration template
+- `host/requirements.txt` - Python dependencies

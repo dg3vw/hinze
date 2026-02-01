@@ -28,9 +28,9 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 | Servo Tilt | SG90 | PWM | Head vertical movement |
 
 ### 2.5 User Input
-| Component | Interface | Purpose |
-|-----------|-----------|---------|
-| Button | GPIO 0 (active low) | Activation trigger |
+| Component | Model | Interface | Purpose |
+|-----------|-------|-----------|---------|
+| Touch Sensor | TTP223 | GPIO 10 (active HIGH) | Push-to-talk activation |
 
 ## 3. Pin Assignment (ESP32-S3 SuperMini)
 
@@ -58,7 +58,7 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 ### 3.4 User Input
 | Function | GPIO | Component |
 |----------|------|-----------|
-| BUTTON | 10 | Activation button (active low, internal pullup) |
+| TOUCH_PIN | 10 | TTP223 capacitive touch sensor (active HIGH) |
 
 ## 4. Communication
 
@@ -117,23 +117,47 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 
 ## 6. Activation Modes
 
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| Wake Word | Local detection of "Hey Hinze" | Hands-free, privacy-focused |
-| Always Listening | Continuous speech detection | Quick response, demo mode |
-| Button Press | GPIO 0 button triggers listening | Battery saving, controlled |
+| Mode | Description | Status |
+|------|-------------|--------|
+| Button Press | Push-to-talk with silence detection | **Implemented** |
+| Wake Word | Local detection of "Hey Hinze" | Planned |
+| Always Listening | Continuous speech detection | Planned |
 
-### 6.1 Button Behavior
-- **GPIO**: 10 (active low, internal pullup)
-- **Debounce**: Software debounce (~50ms)
-- **Short Press**: Trigger listening mode (Idle → Listening)
-- **Detection**: Interrupt-based for responsive input
+### 6.1 Touch Sensor Behavior (Push-to-Talk)
+- **Sensor**: TTP223 capacitive touch sensor
+- **GPIO**: 10 (active HIGH)
+- **Debounce**: Software debounce (200ms)
+- **Detection**: Interrupt on RISING edge
+- **Mode**: Push-to-talk with automatic silence detection
+
+#### TTP223 Wiring
+| TTP223 Pin | ESP32-S3 |
+|------------|----------|
+| VCC | 3.3V |
+| GND | GND |
+| SIG/OUT | GPIO 10 |
+
+#### Recording Flow
+1. **Touch sensor** → Recording starts (Idle → Listening → Streaming)
+2. **Speak** → "Speech detected" when audio exceeds threshold
+3. **Stop speaking** → Auto-stops after 1.5s of silence
+4. **Timeout** → Auto-stops after 10 seconds max
+5. **Manual stop** → Touch again (after 500ms minimum)
+
+#### Silence Detection Parameters
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `SILENCE_THRESHOLD` | 500 | Audio level threshold (0-32767) |
+| `SILENCE_DURATION_MS` | 1500 | Stop after this much silence |
+| `MIN_SPEECH_MS` | 300 | Minimum speech before silence detection |
+| `MAX_RECORDING_MS` | 10000 | Maximum recording time (10 sec) |
 
 ## 7. Functional Requirements
 
 ### 7.1 Voice Interaction
-- [ ] Capture audio via INMP441 I2S microphone
-- [ ] Stream raw PCM audio to host (16kHz, 16-bit)
+- [x] Capture audio via INMP441 I2S microphone
+- [x] Stream raw PCM audio to host (16kHz, 16-bit)
+- [x] Silence detection for automatic recording stop
 - [ ] Receive audio responses from host
 - [ ] Play audio through MAX98357A I2S amplifier
 
@@ -142,7 +166,7 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 - [x] Support 10 emotion states with unique eye styles
 - [x] LED color/pattern mapping to emotions
 - [x] Frame-based animation at ~30 FPS
-- [x] Button input to cycle through emotions (GPIO 1)
+- [x] Button input triggers recording (GPIO 10)
 
 ### 7.3 Head Movement
 - [ ] Pan servo control (left/right, 0-180°)
@@ -151,10 +175,12 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 - [ ] Smooth motion interpolation
 
 ### 7.4 Host Communication
-- [ ] USB serial command interface (JSON)
+- [x] USB serial command interface (JSON)
+- [x] Status reporting
+- [x] Audio streaming (ESP32 → Host)
+- [x] Event notifications (button, audio start/end)
 - [ ] WiFi/WebSocket interface (JSON)
-- [ ] Status reporting
-- [ ] Audio streaming in both directions
+- [ ] Audio streaming (Host → ESP32)
 
 ## 8. OLED Eye Graphics
 
@@ -252,23 +278,47 @@ Update rate: 20-30 FPS for smooth transition
 | Sleepy | Solid | Dim Orange (30°) |
 | Excited | Rainbow Fast | Full spectrum |
 
-## 11. JSON Command Protocol
+## 11. Serial Protocol
 
-### 11.1 Commands (Host → ESP32)
+### 11.1 JSON Commands (Host → ESP32)
 ```json
-{"cmd": "emotion", "state": "happy"}
-{"cmd": "audio_start", "sample_rate": 16000}
-{"cmd": "audio_stop"}
-{"cmd": "servo", "pan": 90, "tilt": 45}
-{"cmd": "led", "r": 0, "g": 255, "b": 0}
-{"cmd": "status"}
+{"cmd": "emotion", "state": "happy"}     // Set emotion state
+{"cmd": "status"}                         // Request status
+{"cmd": "record_start"}                   // Start recording (manual)
+{"cmd": "record_stop"}                    // Stop recording (manual)
 ```
 
-### 11.2 Responses (ESP32 → Host)
+**Available emotions**: `idle`, `listening`, `thinking`, `happy`, `sad`, `angry`, `surprised`, `confused`, `sleepy`, `excited`
+
+### 11.2 JSON Events (ESP32 → Host)
 ```json
-{"status": "ok", "emotion": "idle", "listening": false}
-{"event": "button_press"}
-{"event": "audio_ready"}
+{"event": "ready"}                        // Firmware initialized
+{"event": "button", "action": "press"}    // Button pressed
+{"event": "audio_start"}                  // Recording started
+{"event": "audio_end"}                    // Recording stopped
+```
+
+### 11.3 JSON Responses (ESP32 → Host)
+```json
+{"status": "ok", "version": "0.4", "emotion": "idle", "audio": "idle"}
+{"ok": true, "emotion": "happy"}
+{"error": "JSON parse failed: InvalidInput"}
+```
+
+### 11.4 Audio Streaming Protocol (ESP32 → Host)
+Binary audio packets are sent during recording:
+```
+[0xAA][0x55][len_high][len_low][pcm_data...]
+```
+- **Header**: `0xAA 0x55` (2 bytes)
+- **Length**: Big-endian uint16 (2 bytes) - number of PCM bytes
+- **Data**: Raw 16-bit signed PCM, little-endian, mono, 16kHz
+
+### 11.5 Future Commands (Not Yet Implemented)
+```json
+{"cmd": "servo", "pan": 90, "tilt": 45}   // Head movement
+{"cmd": "led", "r": 0, "g": 255, "b": 0}  // Manual LED control
+{"cmd": "audio_play"}                      // Play audio (followed by PCM data)
 ```
 
 ## 12. Development & Debugging
@@ -324,26 +374,34 @@ pio device list
 The firmware outputs initialization status on boot:
 ```
 =================================
-  Hinze Robot Companion v0.1
+  Hinze Robot Companion v0.4
   ESP32-S3 SuperMini
+  I2S Mic + Serial Commands
 =================================
-[INIT] Setting up I2C...
-[I2C] Scanning...
-[I2C] Device found at 0x3C (OLED)
-[I2C] 1 device(s) found
-[INIT] Setting up I2S audio...
-[I2S] Microphone configured
-[I2S] Amplifier configured
-[INIT] Setting up servos...
-[SERVO] Pan on GPIO 1, Tilt on GPIO 2
+[INIT] Setting up OLED...
+[OLED] Display initialized
 [INIT] Setting up LED...
 [LED] WS2812 on GPIO 48
-[INIT] Setting up button...
-[BUTTON] Input on GPIO 0 (active low)
+[INIT] Setting up touch sensor...
+[TOUCH] TTP223 on GPIO 10 (interrupt enabled)
+[INIT] Setting up I2S microphone...
+[I2S] Microphone configured: 16000Hz, 16-bit
+[I2S] Pins: WS=4, BCK=5, DIN=6
 [INIT] Setup complete!
+{"event":"ready"}
 ```
 
-### 12.7 platformio.ini Configuration
+### 12.7 Runtime Debug Messages
+```
+{"event":"button","action":"press"}
+[AUDIO] Starting recording...
+{"event":"audio_start"}
+[AUDIO] Speech detected
+[AUDIO] Silence detected - stopping
+{"event":"audio_end"}
+```
+
+### 12.8 platformio.ini Configuration
 ```ini
 [env:esp32-s3-supermini]
 platform = espressif32
@@ -355,9 +413,59 @@ monitor_speed = 115200
 build_flags =
     -DARDUINO_USB_MODE=1
     -DARDUINO_USB_CDC_ON_BOOT=1
+
+lib_deps =
+    adafruit/Adafruit SSD1306
+    adafruit/Adafruit GFX Library
+    fastled/FastLED@3.6.0
+    bblanchon/ArduinoJson@^7.0.0
 ```
 
+## 13. Host Application (Python)
+
+### 13.1 Directory Structure
+```
+host/
+├── hinze_host.py      # Main application
+├── config.py          # Configuration template
+├── config_local.py    # Local config (API keys, not in git)
+└── requirements.txt   # Python dependencies
+```
+
+### 13.2 Dependencies
+```
+pyserial>=3.5
+openai-whisper>=20231117
+anthropic>=0.21.0
+piper-tts>=1.2.0
+numpy>=1.24.0
+sounddevice>=0.4.6
+```
+
+### 13.3 Running the Host
+```bash
+cd host
+pip install -r requirements.txt
+cp config.py config_local.py   # Edit with your API key
+python hinze_host.py --port /dev/ttyACM0
+```
+
+### 13.4 Host Components
+| Component | Class | Purpose |
+|-----------|-------|---------|
+| Serial Handler | `SerialHandler` | Manages ESP32 connection, parses packets |
+| Audio Buffer | `AudioBuffer` | Collects incoming PCM samples |
+| Speech Recognition | `SpeechRecognizer` | Whisper transcription |
+| Conversation | `ConversationEngine` | Claude API with emotion extraction |
+| Text-to-Speech | `TextToSpeech` | Piper TTS audio generation |
+
+### 13.5 Claude System Prompt
+The AI is configured with a personality prompt that instructs it to:
+- Keep responses brief (1-2 sentences)
+- Be friendly and slightly playful
+- End every response with an emotion tag: `[happy]`, `[sad]`, etc.
+
 ---
-*Document Version: 1.1*
+*Document Version: 1.3*
 *Created: 2026-01-31*
-*Last Updated: 2026-01-31*
+*Last Updated: 2026-02-01*

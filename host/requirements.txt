@@ -1,0 +1,20 @@
+# Hinze Host Application Dependencies
+
+# Serial communication
+pyserial>=3.5
+
+# Speech-to-text (Whisper)
+openai-whisper>=20231117
+
+# Claude API
+anthropic>=0.21.0
+
+# Text-to-speech (Piper)
+piper-tts>=1.2.0
+
+# Audio processing
+numpy>=1.24.0
+sounddevice>=0.4.6
+
+# Optional: for faster Whisper
+# torch>=2.0.0

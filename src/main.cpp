@@ -3,6 +3,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <FastLED.h>
+#include <driver/i2s.h>
+#include <ArduinoJson.h>
 
 // =============================================================================
 // Pin Definitions - ESP32-S3 SuperMini
@@ -22,9 +24,54 @@
 #define SERVO_PAN       1
 #define SERVO_TILT      2
 
-// LED & Button
+// LED & Touch Sensor
 #define WS2812_DATA     48
-#define BUTTON_PIN      10
+#define TOUCH_PIN       10  // TTP223 touch sensor (active HIGH)
+
+// =============================================================================
+// I2S Audio Configuration
+// =============================================================================
+
+#define I2S_PORT_MIC    I2S_NUM_0
+#define SAMPLE_RATE     16000
+#define SAMPLE_BITS     16
+#define I2S_BUFFER_SIZE 1024
+#define AUDIO_BUFFER_SIZE 4096
+
+// Audio packet header bytes for serial protocol
+#define AUDIO_HEADER_1  0xAA
+#define AUDIO_HEADER_2  0x55
+
+// =============================================================================
+// Audio State Machine
+// =============================================================================
+
+enum AudioState {
+    AUDIO_IDLE = 0,
+    AUDIO_LISTENING,
+    AUDIO_STREAMING
+};
+
+AudioState audioState = AUDIO_IDLE;
+int16_t audioBuffer[AUDIO_BUFFER_SIZE];
+unsigned long recordingStartTime = 0;
+#define MAX_RECORDING_MS 10000  // 10 second max recording
+
+// Silence detection
+#define SILENCE_THRESHOLD   500     // Audio level threshold (0-32767)
+#define SILENCE_DURATION_MS 1500    // Stop after this much silence (ms)
+#define MIN_SPEECH_MS       300     // Minimum speech before silence detection kicks in
+
+unsigned long lastSoundTime = 0;
+bool speechDetected = false;
+
+// =============================================================================
+// Serial Command Buffer
+// =============================================================================
+
+#define SERIAL_BUFFER_SIZE 256
+char serialBuffer[SERIAL_BUFFER_SIZE];
+int serialBufferIndex = 0;
 
 // =============================================================================
 // Display Configuration
@@ -53,7 +100,7 @@ uint8_t rainbowHue = 0;
 
 volatile bool buttonPressed = false;
 volatile unsigned long lastButtonPress = 0;
-#define DEBOUNCE_MS     50
+#define DEBOUNCE_MS     200  // Increased to handle release bounce
 
 void IRAM_ATTR buttonISR() {
     unsigned long now = millis();
@@ -117,11 +164,21 @@ unsigned long animationFrame = 0;
 void setupDisplay();
 void setupLED();
 void setupButton();
+void setupI2SMic();
 void updateEyes();
 void drawEyes();
 void updateLED();
 void handleButton();
 void updateIdleBehavior();
+void handleSerialCommands();
+void processCommand(const char* json);
+void setEmotionByName(const char* name);
+void sendStatus();
+void sendEvent(const char* event, const char* action = nullptr);
+void updateAudioCapture();
+void startRecording();
+void stopRecording();
+void streamAudioPacket(int16_t* data, size_t samples);
 
 // Eye drawing functions for each emotion
 void drawIdleEyes();
@@ -149,8 +206,9 @@ void setup() {
 
     Serial.println();
     Serial.println("=================================");
-    Serial.println("  Hinze Robot Companion v0.3");
+    Serial.println("  Hinze Robot Companion v0.4");
     Serial.println("  ESP32-S3 SuperMini");
+    Serial.println("  I2S Mic + Serial Commands");
     Serial.println("=================================");
 
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -158,8 +216,10 @@ void setup() {
     setupDisplay();
     setupLED();
     setupButton();
+    setupI2SMic();
 
     Serial.println("[INIT] Setup complete!");
+    sendEvent("ready");
 }
 
 // =============================================================================
@@ -167,9 +227,11 @@ void setup() {
 // =============================================================================
 
 void loop() {
+    handleSerialCommands();
     handleButton();
+    updateAudioCapture();
 
-    if (currentEmotion == EMOTION_IDLE) {
+    if (currentEmotion == EMOTION_IDLE && audioState == AUDIO_IDLE) {
         updateIdleBehavior();
     }
 
@@ -197,7 +259,7 @@ void setupDisplay() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(30, 28);
-    display.print("Hinze v0.3");
+    display.print("Hinze v0.4");
     display.display();
     delay(1000);
 
@@ -624,23 +686,277 @@ void updateLED() {
 // =============================================================================
 
 void setupButton() {
-    Serial.println("[INIT] Setting up button...");
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
-    Serial.printf("[BUTTON] Input on GPIO %d (interrupt enabled)\n", BUTTON_PIN);
+    Serial.println("[INIT] Setting up touch sensor...");
+    pinMode(TOUCH_PIN, INPUT);  // TTP223 has its own output driver
+    attachInterrupt(digitalPinToInterrupt(TOUCH_PIN), buttonISR, RISING);  // Active HIGH
+    Serial.printf("[TOUCH] TTP223 on GPIO %d (interrupt enabled)\n", TOUCH_PIN);
 }
 
 void handleButton() {
+    // Push-to-talk: press to start, auto-stop on silence or timeout
+
     if (buttonPressed) {
         buttonPressed = false;
-        Serial.println("[BUTTON] Pressed!");
 
-        currentEmotion = (Emotion)((currentEmotion + 1) % 10);
-        Serial.printf("[EMOTION] Changed to: %d\n", currentEmotion);
+        if (audioState == AUDIO_IDLE) {
+            sendEvent("button", "press");
+            startRecording();
 
-        // Reset states
-        targetPupilX = 0;
-        targetPupilY = 0;
-        animationFrame = 0;
+            // Reset animation states
+            targetPupilX = 0;
+            targetPupilY = 0;
+            animationFrame = 0;
+        } else if (audioState == AUDIO_STREAMING) {
+            // Only allow manual stop after minimum recording time (prevent bounce)
+            if (millis() - recordingStartTime > 500) {
+                sendEvent("button", "press");
+                stopRecording();
+            }
+        }
+    }
+}
+
+// =============================================================================
+// I2S Microphone Setup
+// =============================================================================
+
+void setupI2SMic() {
+    Serial.println("[INIT] Setting up I2S microphone...");
+
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = I2S_BUFFER_SIZE,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCK,
+        .ws_io_num = I2S_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = I2S_DIN
+    };
+
+    esp_err_t err = i2s_driver_install(I2S_PORT_MIC, &i2s_config, 0, NULL);
+    if (err != ESP_OK) {
+        Serial.printf("[I2S] ERROR: Driver install failed: %d\n", err);
+        return;
+    }
+
+    err = i2s_set_pin(I2S_PORT_MIC, &pin_config);
+    if (err != ESP_OK) {
+        Serial.printf("[I2S] ERROR: Pin config failed: %d\n", err);
+        return;
+    }
+
+    Serial.printf("[I2S] Microphone configured: %dHz, %d-bit\n", SAMPLE_RATE, SAMPLE_BITS);
+    Serial.printf("[I2S] Pins: WS=%d, BCK=%d, DIN=%d\n", I2S_WS, I2S_BCK, I2S_DIN);
+}
+
+// =============================================================================
+// Audio Capture Functions
+// =============================================================================
+
+void startRecording() {
+    Serial.println("[AUDIO] Starting recording...");
+    audioState = AUDIO_LISTENING;
+    currentEmotion = EMOTION_LISTENING;
+    recordingStartTime = millis();
+    lastSoundTime = millis();
+    speechDetected = false;
+    sendEvent("audio_start");
+
+    // Small delay then start streaming
+    delay(50);
+    audioState = AUDIO_STREAMING;
+}
+
+void stopRecording() {
+    Serial.println("[AUDIO] Stopping recording...");
+    audioState = AUDIO_IDLE;
+    currentEmotion = EMOTION_THINKING;
+    sendEvent("audio_end");
+}
+
+// Calculate average audio level (simple absolute mean)
+uint16_t calculateAudioLevel(int16_t* samples, size_t count) {
+    if (count == 0) return 0;
+
+    uint32_t sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        sum += abs(samples[i]);
+    }
+    return sum / count;
+}
+
+void updateAudioCapture() {
+    if (audioState != AUDIO_STREAMING) {
+        return;
+    }
+
+    unsigned long now = millis();
+    unsigned long elapsed = now - recordingStartTime;
+
+    // Check for timeout
+    if (elapsed > MAX_RECORDING_MS) {
+        Serial.println("[AUDIO] Recording timeout");
+        stopRecording();
+        return;
+    }
+
+    // Read audio data from I2S
+    size_t bytesRead = 0;
+    esp_err_t err = i2s_read(I2S_PORT_MIC, audioBuffer,
+                             AUDIO_BUFFER_SIZE * sizeof(int16_t),
+                             &bytesRead, 10 / portTICK_PERIOD_MS);
+
+    if (err == ESP_OK && bytesRead > 0) {
+        size_t samplesRead = bytesRead / sizeof(int16_t);
+
+        // Calculate audio level for silence detection
+        uint16_t level = calculateAudioLevel(audioBuffer, samplesRead);
+
+        // Check if sound detected
+        if (level > SILENCE_THRESHOLD) {
+            lastSoundTime = now;
+            if (!speechDetected && elapsed > MIN_SPEECH_MS) {
+                speechDetected = true;
+                Serial.println("[AUDIO] Speech detected");
+            }
+        }
+
+        // Check for silence (only after minimum speech time)
+        if (speechDetected && (now - lastSoundTime > SILENCE_DURATION_MS)) {
+            Serial.println("[AUDIO] Silence detected - stopping");
+            stopRecording();
+            return;
+        }
+
+        // Stream the audio
+        streamAudioPacket(audioBuffer, samplesRead);
+    }
+}
+
+void streamAudioPacket(int16_t* data, size_t samples) {
+    // Send audio packet with header: [0xAA][0x55][len_high][len_low][pcm_data...]
+    size_t dataBytes = samples * sizeof(int16_t);
+
+    Serial.write(AUDIO_HEADER_1);
+    Serial.write(AUDIO_HEADER_2);
+    Serial.write((uint8_t)(dataBytes >> 8));
+    Serial.write((uint8_t)(dataBytes & 0xFF));
+    Serial.write((uint8_t*)data, dataBytes);
+}
+
+// =============================================================================
+// Serial Command Handling
+// =============================================================================
+
+void handleSerialCommands() {
+    while (Serial.available()) {
+        char c = Serial.read();
+
+        if (c == '\n' || c == '\r') {
+            if (serialBufferIndex > 0) {
+                serialBuffer[serialBufferIndex] = '\0';
+                processCommand(serialBuffer);
+                serialBufferIndex = 0;
+            }
+        } else if (serialBufferIndex < SERIAL_BUFFER_SIZE - 1) {
+            serialBuffer[serialBufferIndex++] = c;
+        }
+    }
+}
+
+void processCommand(const char* json) {
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, json);
+
+    if (error) {
+        Serial.printf("{\"error\":\"JSON parse failed: %s\"}\n", error.c_str());
+        return;
+    }
+
+    const char* cmd = doc["cmd"];
+    if (!cmd) {
+        Serial.println("{\"error\":\"Missing cmd field\"}");
+        return;
+    }
+
+    if (strcmp(cmd, "emotion") == 0) {
+        const char* state = doc["state"];
+        if (state) {
+            setEmotionByName(state);
+            Serial.printf("{\"ok\":true,\"emotion\":\"%s\"}\n", state);
+        } else {
+            Serial.println("{\"error\":\"Missing state field\"}");
+        }
+    }
+    else if (strcmp(cmd, "status") == 0) {
+        sendStatus();
+    }
+    else if (strcmp(cmd, "record_start") == 0) {
+        if (audioState == AUDIO_IDLE) {
+            startRecording();
+            Serial.println("{\"ok\":true,\"action\":\"recording\"}");
+        } else {
+            Serial.println("{\"error\":\"Already recording\"}");
+        }
+    }
+    else if (strcmp(cmd, "record_stop") == 0) {
+        if (audioState == AUDIO_STREAMING) {
+            stopRecording();
+            Serial.println("{\"ok\":true,\"action\":\"stopped\"}");
+        } else {
+            Serial.println("{\"error\":\"Not recording\"}");
+        }
+    }
+    else {
+        Serial.printf("{\"error\":\"Unknown command: %s\"}\n", cmd);
+    }
+}
+
+void setEmotionByName(const char* name) {
+    if (strcmp(name, "idle") == 0) currentEmotion = EMOTION_IDLE;
+    else if (strcmp(name, "listening") == 0) currentEmotion = EMOTION_LISTENING;
+    else if (strcmp(name, "thinking") == 0) currentEmotion = EMOTION_THINKING;
+    else if (strcmp(name, "happy") == 0) currentEmotion = EMOTION_HAPPY;
+    else if (strcmp(name, "sad") == 0) currentEmotion = EMOTION_SAD;
+    else if (strcmp(name, "angry") == 0) currentEmotion = EMOTION_ANGRY;
+    else if (strcmp(name, "surprised") == 0) currentEmotion = EMOTION_SURPRISED;
+    else if (strcmp(name, "confused") == 0) currentEmotion = EMOTION_CONFUSED;
+    else if (strcmp(name, "sleepy") == 0) currentEmotion = EMOTION_SLEEPY;
+    else if (strcmp(name, "excited") == 0) currentEmotion = EMOTION_EXCITED;
+
+    // Reset animation states
+    targetPupilX = 0;
+    targetPupilY = 0;
+    animationFrame = 0;
+}
+
+void sendStatus() {
+    const char* emotionNames[] = {
+        "idle", "listening", "thinking", "happy", "sad",
+        "angry", "surprised", "confused", "sleepy", "excited"
+    };
+    const char* audioStateNames[] = {"idle", "listening", "streaming"};
+
+    Serial.printf("{\"status\":\"ok\",\"version\":\"0.4\",\"emotion\":\"%s\",\"audio\":\"%s\"}\n",
+                  emotionNames[currentEmotion],
+                  audioStateNames[audioState]);
+}
+
+void sendEvent(const char* event, const char* action) {
+    if (action) {
+        Serial.printf("{\"event\":\"%s\",\"action\":\"%s\"}\n", event, action);
+    } else {
+        Serial.printf("{\"event\":\"%s\"}\n", event);
     }
 }
