@@ -58,7 +58,7 @@ unsigned long recordingStartTime = 0;
 #define MAX_RECORDING_MS 10000  // 10 second max recording
 
 // Silence detection
-#define SILENCE_THRESHOLD   500     // Audio level threshold (0-32767)
+#define SILENCE_THRESHOLD   80      // Audio level threshold (adjust based on mic sensitivity)
 #define SILENCE_DURATION_MS 1500    // Stop after this much silence (ms)
 #define MIN_SPEECH_MS       300     // Minimum speech before silence detection kicks in
 
@@ -727,7 +727,7 @@ void setupI2SMic() {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // L/R pin to GND = LEFT channel
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 4,
@@ -822,6 +822,13 @@ void updateAudioCapture() {
 
         // Calculate audio level for silence detection
         uint16_t level = calculateAudioLevel(audioBuffer, samplesRead);
+
+        // Debug: print audio level every ~500ms
+        static unsigned long lastLevelPrint = 0;
+        if (now - lastLevelPrint > 500) {
+            Serial.printf("[MIC] Level: %5d (threshold: %d)\n", level, SILENCE_THRESHOLD);
+            lastLevelPrint = now;
+        }
 
         // Check if sound detected
         if (level > SILENCE_THRESHOLD) {

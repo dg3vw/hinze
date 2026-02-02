@@ -3,7 +3,7 @@
 ## Project Overview
 Interactive robot companion with ESP32-S3, featuring voice interaction via host PC (Whisper/Claude/Piper), emotional OLED eyes, head movement, and LED feedback.
 
-## Current State (2026-02-01)
+## Current State (2026-02-02)
 
 ### Completed
 - [x] Functional Specification Document (hinze_FSD.md)
@@ -18,6 +18,10 @@ Interactive robot companion with ESP32-S3, featuring voice interaction via host 
 - [x] Serial JSON command parser
 - [x] Audio streaming protocol (binary packets)
 - [x] Python host application skeleton
+- [x] Python virtual environment created (host/venv)
+- [x] All Python dependencies installed (whisper, anthropic, piper-tts)
+- [x] Whisper "base" model downloaded (~140MB)
+- [x] Host connects to ESP32 serial successfully
 
 ### Hardware Verified
 | Component | Status | Notes |
@@ -85,11 +89,12 @@ Binary format: `[0xAA][0x55][len_high][len_low][pcm_data...]`
 3. ~~Implement serial command parser (JSON)~~ (done)
 4. ~~Add I2S microphone capture~~ (done)
 5. ~~Create Python host application skeleton~~ (done)
-6. Test I2S microphone audio capture end-to-end
-7. Test Python host with Whisper transcription
-8. Test Claude API integration
-9. Add I2S amplifier audio playback
-10. Add servo library and test head movement
+6. ~~Set up Python venv and install dependencies~~ (done)
+7. Test I2S microphone audio capture end-to-end
+8. Test Python host with Whisper transcription
+9. Test Claude API integration
+10. Add I2S amplifier audio playback
+11. Add servo library and test head movement
 
 ## Build Commands
 ```bash

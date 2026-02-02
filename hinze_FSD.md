@@ -445,10 +445,14 @@ sounddevice>=0.4.6
 ### 13.3 Running the Host
 ```bash
 cd host
+python3 -m venv venv           # Create virtual environment
+source venv/bin/activate       # Activate venv (Linux/macOS)
 pip install -r requirements.txt
 cp config.py config_local.py   # Edit with your API key
 python hinze_host.py --port /dev/ttyACM0
 ```
+
+**Note**: On first run, Whisper will download the model (~140MB for "base").
 
 ### 13.4 Host Components
 | Component | Class | Purpose |
@@ -466,6 +470,6 @@ The AI is configured with a personality prompt that instructs it to:
 - End every response with an emotion tag: `[happy]`, `[sad]`, etc.
 
 ---
-*Document Version: 1.3*
+*Document Version: 1.4*
 *Created: 2026-01-31*
-*Last Updated: 2026-02-01*
+*Last Updated: 2026-02-02*

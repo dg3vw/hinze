@@ -3,3 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Host application
+host/config_local.py
+host/venv/
+host/__pycache__/
+
+# IDE
+.vscode/
