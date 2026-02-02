@@ -10,10 +10,10 @@
 // Pin Definitions - ESP32-S3 SuperMini
 // =============================================================================
 
-// I2S Audio (for future use)
-#define I2S_WS          4
-#define I2S_BCK         5
-#define I2S_DIN         6
+// I2S Audio
+#define I2S_WS          5
+#define I2S_BCK         6
+#define I2S_DIN         4
 #define I2S_DOUT        7
 
 // I2C Display
@@ -53,14 +53,18 @@ enum AudioState {
 };
 
 AudioState audioState = AUDIO_IDLE;
-int16_t audioBuffer[AUDIO_BUFFER_SIZE];
+int32_t rawAudioBuffer[AUDIO_BUFFER_SIZE];  // 32-bit buffer for INMP441
+int16_t audioBuffer[AUDIO_BUFFER_SIZE];     // 16-bit buffer for output
 unsigned long recordingStartTime = 0;
 #define MAX_RECORDING_MS 10000  // 10 second max recording
 
 // Silence detection
-#define SILENCE_THRESHOLD   80      // Audio level threshold (adjust based on mic sensitivity)
+#define SILENCE_THRESHOLD   1000    // Audio level threshold
 #define SILENCE_DURATION_MS 1500    // Stop after this much silence (ms)
 #define MIN_SPEECH_MS       300     // Minimum speech before silence detection kicks in
+
+// Software gain for microphone (after 32-bit to 16-bit conversion)
+#define MIC_GAIN            4       // Small additional gain if needed
 
 unsigned long lastSoundTime = 0;
 bool speechDetected = false;
@@ -206,9 +210,9 @@ void setup() {
 
     Serial.println();
     Serial.println("=================================");
-    Serial.println("  Hinze Robot Companion v0.4");
+    Serial.println("  Hinze Robot Companion v0.5");
     Serial.println("  ESP32-S3 SuperMini");
-    Serial.println("  I2S Mic + Serial Commands");
+    Serial.println("  I2S Mic + Gain Boost");
     Serial.println("=================================");
 
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -259,7 +263,7 @@ void setupDisplay() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(30, 28);
-    display.print("Hinze v0.4");
+    display.print("Hinze v0.5");
     display.display();
     delay(1000);
 
@@ -726,7 +730,7 @@ void setupI2SMic() {
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,  // INMP441 outputs 24-bit in 32-bit frame
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // L/R pin to GND = LEFT channel
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
@@ -811,14 +815,26 @@ void updateAudioCapture() {
         return;
     }
 
-    // Read audio data from I2S
+    // Read 32-bit audio data from I2S (INMP441 outputs 24-bit in 32-bit frame)
     size_t bytesRead = 0;
-    esp_err_t err = i2s_read(I2S_PORT_MIC, audioBuffer,
-                             AUDIO_BUFFER_SIZE * sizeof(int16_t),
+    esp_err_t err = i2s_read(I2S_PORT_MIC, rawAudioBuffer,
+                             AUDIO_BUFFER_SIZE * sizeof(int32_t),
                              &bytesRead, 10 / portTICK_PERIOD_MS);
 
     if (err == ESP_OK && bytesRead > 0) {
-        size_t samplesRead = bytesRead / sizeof(int16_t);
+        size_t samplesRead = bytesRead / sizeof(int32_t);
+
+        // Convert 32-bit to 16-bit (INMP441 data is in upper 24 bits, left-justified)
+        // Shift right by 14 to get 18 bits, then take lower 16 bits
+        for (size_t i = 0; i < samplesRead; i++) {
+            int32_t sample = rawAudioBuffer[i] >> 14;  // Extract upper bits
+            // Apply small gain if needed
+            sample = sample * MIC_GAIN;
+            // Clamp to 16-bit range
+            if (sample > 32767) sample = 32767;
+            if (sample < -32768) sample = -32768;
+            audioBuffer[i] = (int16_t)sample;
+        }
 
         // Calculate audio level for silence detection
         uint16_t level = calculateAudioLevel(audioBuffer, samplesRead);
@@ -955,7 +971,7 @@ void sendStatus() {
     };
     const char* audioStateNames[] = {"idle", "listening", "streaming"};
 
-    Serial.printf("{\"status\":\"ok\",\"version\":\"0.4\",\"emotion\":\"%s\",\"audio\":\"%s\"}\n",
+    Serial.printf("{\"status\":\"ok\",\"version\":\"0.5\",\"emotion\":\"%s\",\"audio\":\"%s\"}\n",
                   emotionNames[currentEmotion],
                   audioStateNames[audioState]);
 }

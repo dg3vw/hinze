@@ -37,9 +37,9 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 ### 3.1 I2S Audio (Shared Bus)
 | Function | GPIO | Component |
 |----------|------|-----------|
-| I2S_WS (Word Select) | 4 | INMP441 + MAX98357A |
-| I2S_BCK (Bit Clock) | 5 | INMP441 + MAX98357A |
-| I2S_DIN (Mic Data In) | 6 | INMP441 SD |
+| I2S_DIN (Mic Data In) | 4 | INMP441 SD |
+| I2S_WS (Word Select) | 5 | INMP441 + MAX98357A |
+| I2S_BCK (Bit Clock) | 6 | INMP441 + MAX98357A |
 | I2S_DOUT (Amp Data Out) | 7 | MAX98357A DIN |
 
 ### 3.2 I2C Display
