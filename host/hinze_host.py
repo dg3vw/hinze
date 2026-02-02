@@ -35,7 +35,18 @@ try:
     ANTHROPIC_AVAILABLE = True
 except ImportError:
     ANTHROPIC_AVAILABLE = False
-    print("Warning: anthropic not installed. Claude API disabled.")
+
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True  # Used for OpenRouter
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 try:
     from piper import PiperVoice
@@ -253,72 +264,148 @@ class SpeechRecognizer:
 
 
 class ConversationEngine:
-    """Handles conversation with Claude API."""
+    """Handles conversation with multiple LLM backends."""
 
     def __init__(self):
+        self.backend = getattr(sys.modules[__name__], 'LLM_BACKEND', 'ollama')
         self.client = None
         self.conversation_history = []
 
     def connect(self) -> bool:
-        """Initialize Claude client."""
-        if not ANTHROPIC_AVAILABLE:
-            print("[CLAUDE] Not available")
+        """Initialize LLM client based on configured backend."""
+        try:
+            backend = self.backend
+        except:
+            backend = "ollama"
+
+        if backend == "anthropic":
+            return self._connect_anthropic()
+        elif backend == "ollama":
+            return self._connect_ollama()
+        elif backend == "openrouter":
+            return self._connect_openrouter()
+        else:
+            print(f"[LLM] Unknown backend: {backend}")
             return False
-        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        print("[CLAUDE] Connected")
-        return True
+
+    def _connect_anthropic(self) -> bool:
+        if not ANTHROPIC_AVAILABLE:
+            print("[ANTHROPIC] Not available - install: pip install anthropic")
+            return False
+        try:
+            self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            print("[ANTHROPIC] Connected")
+            return True
+        except Exception as e:
+            print(f"[ANTHROPIC] Error: {e}")
+            return False
+
+    def _connect_ollama(self) -> bool:
+        if not OLLAMA_AVAILABLE:
+            print("[OLLAMA] Not available - install: pip install ollama")
+            return False
+        try:
+            # Test connection by listing models
+            ollama.list()
+            print(f"[OLLAMA] Connected to {OLLAMA_HOST}")
+            return True
+        except Exception as e:
+            print(f"[OLLAMA] Error connecting: {e}")
+            print("[OLLAMA] Make sure Ollama is running: ollama serve")
+            return False
+
+    def _connect_openrouter(self) -> bool:
+        if not OPENAI_AVAILABLE:
+            print("[OPENROUTER] Not available - install: pip install openai")
+            return False
+        try:
+            self.client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=OPENROUTER_API_KEY
+            )
+            print(f"[OPENROUTER] Connected")
+            return True
+        except Exception as e:
+            print(f"[OPENROUTER] Error: {e}")
+            return False
 
     def chat(self, user_message: str) -> tuple[str, str]:
-        """
-        Send message to Claude, get response and emotion.
-
-        Returns:
-            tuple: (response_text, emotion)
-        """
-        if not self.client:
-            return "I'm sorry, I can't think right now.", "sad"
-
+        """Send message to LLM, get response and emotion."""
         self.conversation_history.append({
             "role": "user",
             "content": user_message
         })
 
         try:
-            response = self.client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=150,
-                system=CLAUDE_SYSTEM_PROMPT,
-                messages=self.conversation_history
-            )
+            backend = self.backend
+        except:
+            backend = "ollama"
 
-            assistant_message = response.content[0].text
+        try:
+            if backend == "anthropic":
+                response = self._chat_anthropic()
+            elif backend == "ollama":
+                response = self._chat_ollama()
+            elif backend == "openrouter":
+                response = self._chat_openrouter()
+            else:
+                return "I don't know how to think.", "confused"
+
             self.conversation_history.append({
                 "role": "assistant",
-                "content": assistant_message
+                "content": response
             })
 
             # Keep conversation history reasonable
             if len(self.conversation_history) > 20:
                 self.conversation_history = self.conversation_history[-10:]
 
-            # Extract emotion from response
-            text, emotion = self._extract_emotion(assistant_message)
-            return text, emotion
+            return self._extract_emotion(response)
 
         except Exception as e:
-            print(f"[CLAUDE] Error: {e}")
+            print(f"[LLM] Error: {e}")
             return "I'm having trouble thinking right now.", "confused"
+
+    def _chat_anthropic(self) -> str:
+        response = self.client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=150,
+            system=SYSTEM_PROMPT,
+            messages=self.conversation_history
+        )
+        return response.content[0].text
+
+    def _chat_ollama(self) -> str:
+        # Build messages with system prompt
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(self.conversation_history)
+
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=messages
+        )
+        return response['message']['content']
+
+    def _chat_openrouter(self) -> str:
+        # Build messages with system prompt
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(self.conversation_history)
+
+        response = self.client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            max_tokens=150,
+            messages=messages
+        )
+        return response.choices[0].message.content
 
     def _extract_emotion(self, text: str) -> tuple[str, str]:
         """Extract emotion tag from response."""
-        # Match emotion tag at end of text
         pattern = r'\[(\w+)\]\s*$'
         match = re.search(pattern, text)
 
         if match:
             emotion = match.group(1).lower()
             clean_text = text[:match.start()].strip()
-            # Validate emotion
             valid_emotions = [
                 "idle", "listening", "thinking", "happy", "sad",
                 "angry", "surprised", "confused", "sleepy", "excited"

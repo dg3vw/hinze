@@ -6,8 +6,10 @@ pyserial>=3.5
 # Speech-to-text (Whisper)
 openai-whisper>=20231117
 
-# Claude API
-anthropic>=0.21.0
+# LLM Backends
+anthropic>=0.21.0      # Claude API
+ollama>=0.4.0          # Local Ollama
+openai>=1.0.0          # OpenRouter (uses OpenAI SDK)
 
 # Text-to-speech (Piper)
 piper-tts>=1.2.0
