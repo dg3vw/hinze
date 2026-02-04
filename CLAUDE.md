@@ -3,7 +3,7 @@
 ## Project Overview
 Interactive robot companion with ESP32-S3, featuring voice interaction via host PC (Whisper/Claude/Piper), emotional OLED eyes, head movement, and LED feedback.
 
-## Current State (2026-02-02)
+## Current State (2026-02-03)
 
 ### Completed
 - [x] Functional Specification Document (hinze_FSD.md)
@@ -31,18 +31,22 @@ Interactive robot companion with ESP32-S3, featuring voice interaction via host 
 | WS2812 LED | Working | Rainbow cycle + emotion colors |
 | TTP223 Touch | Working | GPIO 10, active HIGH, triggers recording |
 | INMP441 Mic | **Working** | I2S 32-bit mode, 16kHz, levels 400-4500 |
-| MAX98357A Amp | Configured | I2S output, not yet implemented |
+| MAX98357A Amp | **Working** | I2S 32-bit, 8kHz, ~11s buffer, German TTS |
 | SG90 Servos | Pins set | GPIO 1 (pan), GPIO 2 (tilt), not yet integrated |
 
-### End-to-End Test (2026-02-02)
+### End-to-End Test (2026-02-03)
 - ✅ Touch sensor triggers recording
 - ✅ Audio captured and streamed to host
 - ✅ Whisper transcription working (German)
 - ✅ Emotion display updates on ESP32
-- ⚠️ Claude API needs credits (https://console.anthropic.com/)
+- ✅ Multi-backend LLM support (Ollama, OpenRouter, Anthropic)
+- ✅ Ollama with llama3.2 tested and working (free, local)
+- ✅ Short conversation history (3 turns for follow-ups)
+- ✅ Piper TTS audio playback working (German voice)
+- ✅ Full voice interaction loop complete!
 
 ### Firmware Version
-**v0.5** - I2S Microphone (32-bit) + Corrected Pin Mapping
+**v0.6** - I2S Microphone + Speaker Output
 
 ## Pin Reference (Quick)
 ```
@@ -61,6 +65,8 @@ Touch:  TTP223=GPIO 10 (active HIGH)
 {"cmd":"status"}                       // Request status
 {"cmd":"record_start"}                 // Start recording
 {"cmd":"record_stop"}                  // Stop recording
+{"cmd":"play_start"}                   // Start audio playback mode
+{"cmd":"play_stop"}                    // Stop audio playback mode
 ```
 
 ### ESP32 -> Host (JSON events)
@@ -75,6 +81,31 @@ Touch:  TTP223=GPIO 10 (active HIGH)
 Binary format: `[0xAA][0x55][len_high][len_low][pcm_data...]`
 - 16-bit signed PCM, little-endian
 - 16kHz sample rate
+
+### Audio Packets (Host -> ESP32)
+Same binary format, sent after `play_start` command:
+- 16-bit signed PCM, little-endian
+- 8kHz sample rate (resampled from Piper's 22.05kHz)
+- Buffer-then-play: all audio buffered before playback (~11 sec max)
+
+## Audio Implementation Notes
+
+### I2S Port Switching
+The mic (INMP441) and speaker (MAX98357A) share the I2S bus (BCK/WS pins). The firmware switches dynamically:
+1. Normal state: Mic driver installed (I2S_NUM_0)
+2. For playback: Uninstall mic → Install speaker driver → Play → Uninstall speaker → Reinstall mic
+
+### Speaker Configuration
+- I2S format: 32-bit stereo (`I2S_BITS_PER_SAMPLE_32BIT`)
+- 16-bit audio samples shifted left by 16 bits for 32-bit frame
+- DMA: 16 buffers × 1024 samples
+- Buffer: 90000 samples (int16_t) = ~11 seconds at 8kHz
+
+### TTS Pipeline
+1. Piper synthesizes at 22050Hz
+2. Host resamples to 8000Hz (scipy.signal.resample)
+3. Audio sent via serial in binary packets
+4. ESP32 buffers all audio, then plays
 
 ## Implemented Emotions
 | # | Emotion | Eyes | LED |
@@ -99,8 +130,8 @@ Binary format: `[0xAA][0x55][len_high][len_low][pcm_data...]`
 6. ~~Set up Python venv and install dependencies~~ (done)
 7. ~~Test I2S microphone audio capture end-to-end~~ (done)
 8. ~~Test Python host with Whisper transcription~~ (done - German working)
-9. ~~Test Claude API integration~~ (done - needs API credits)
-10. Add I2S amplifier audio playback
+9. ~~Test LLM integration~~ (done - Ollama/OpenRouter/Anthropic)
+10. ~~Add I2S amplifier audio playback~~ (done - Piper TTS to ESP32)
 11. Add servo library and test head movement
 
 ## Build Commands
@@ -114,9 +145,28 @@ pio run -t upload -t monitor  # All-in-one
 ## Host Application
 ```bash
 cd host
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
-cp config.py config_local.py  # Edit with your API key
+cp config.py config_local.py  # Edit settings
 python hinze_host.py          # Run host application
+```
+
+## LLM Backends
+Configure in `host/config_local.py`:
+
+| Backend | Config | Notes |
+|---------|--------|-------|
+| **Ollama** | `LLM_BACKEND = "ollama"` | Free, local, requires `ollama pull llama3.2` |
+| **OpenRouter** | `LLM_BACKEND = "openrouter"` | Free tier available, needs API key |
+| **DeepSeek** | `LLM_BACKEND = "deepseek"` | Very affordable, fast responses |
+| **Anthropic** | `LLM_BACKEND = "anthropic"` | Claude API, needs credits |
+
+```python
+# Example config_local.py for DeepSeek
+LLM_BACKEND = "deepseek"
+DEEPSEEK_API_KEY = "sk-..."
+DEEPSEEK_MODEL = "deepseek-chat"  # or "deepseek-reasoner"
 ```
 
 ## Repository

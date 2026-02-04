@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import struct
 import sys
@@ -58,8 +59,12 @@ except ImportError:
 # Load configuration
 try:
     from config_local import *
+    print("[CONFIG] Loaded config_local.py")
 except ImportError:
     from config import *
+    print("[CONFIG] Loaded config.py (no config_local.py found)")
+
+print(f"[CONFIG] System prompt starts with: {SYSTEM_PROMPT[:160].strip()}...")
 
 
 class AudioBuffer:
@@ -221,6 +226,40 @@ class SerialHandler:
         """Stop audio recording."""
         self.send_command({"cmd": "record_stop"})
 
+    def start_playback(self):
+        """Start audio playback mode."""
+        self.send_command({"cmd": "play_start"})
+
+    def stop_playback(self):
+        """Stop audio playback mode."""
+        self.send_command({"cmd": "play_stop"})
+
+    def send_audio(self, audio: np.ndarray, chunk_size: int = 1024):
+        """Send audio data to ESP32 for playback."""
+        if not self.serial:
+            return
+
+        # Convert to int16 if needed
+        if audio.dtype != np.int16:
+            audio = (audio * 32767).astype(np.int16)
+
+        # Send in chunks
+        for i in range(0, len(audio), chunk_size):
+            chunk = audio[i:i + chunk_size]
+            data = chunk.tobytes()
+            data_len = len(data)
+
+            # Send packet: header + length + data
+            packet = bytes([
+                self.HEADER_1,
+                self.HEADER_2,
+                (data_len >> 8) & 0xFF,
+                data_len & 0xFF
+            ]) + data
+
+            self.serial.write(packet)
+            time.sleep(0.01)  # Short delay, let ESP32 buffer
+
     def wait_for_event(self, event_name: str, timeout: float = 10.0) -> dict | None:
         """Wait for a specific event."""
         start = time.time()
@@ -284,6 +323,8 @@ class ConversationEngine:
             return self._connect_ollama()
         elif backend == "openrouter":
             return self._connect_openrouter()
+        elif backend == "deepseek":
+            return self._connect_deepseek()
         else:
             print(f"[LLM] Unknown backend: {backend}")
             return False
@@ -329,8 +370,24 @@ class ConversationEngine:
             print(f"[OPENROUTER] Error: {e}")
             return False
 
+    def _connect_deepseek(self) -> bool:
+        if not OPENAI_AVAILABLE:
+            print("[DEEPSEEK] Not available - install: pip install openai")
+            return False
+        try:
+            self.client = OpenAI(
+                base_url="https://api.deepseek.com",
+                api_key=DEEPSEEK_API_KEY
+            )
+            print(f"[DEEPSEEK] Connected")
+            return True
+        except Exception as e:
+            print(f"[DEEPSEEK] Error: {e}")
+            return False
+
     def chat(self, user_message: str) -> tuple[str, str]:
         """Send message to LLM, get response and emotion."""
+        # Add user message to history
         self.conversation_history.append({
             "role": "user",
             "content": user_message
@@ -348,17 +405,20 @@ class ConversationEngine:
                 response = self._chat_ollama()
             elif backend == "openrouter":
                 response = self._chat_openrouter()
+            elif backend == "deepseek":
+                response = self._chat_deepseek()
             else:
                 return "I don't know how to think.", "confused"
 
+            # Add assistant response to history
             self.conversation_history.append({
                 "role": "assistant",
                 "content": response
             })
 
-            # Keep conversation history reasonable
-            if len(self.conversation_history) > 20:
-                self.conversation_history = self.conversation_history[-10:]
+            # Keep only last 3 turns (6 messages: 3 user + 3 assistant)
+            if len(self.conversation_history) > 6:
+                self.conversation_history = self.conversation_history[-6:]
 
             return self._extract_emotion(response)
 
@@ -398,6 +458,18 @@ class ConversationEngine:
         )
         return response.choices[0].message.content
 
+    def _chat_deepseek(self) -> str:
+        # Build messages with system prompt
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(self.conversation_history)
+
+        response = self.client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            max_tokens=150,
+            messages=messages
+        )
+        return response.choices[0].message.content
+
     def _extract_emotion(self, text: str) -> tuple[str, str]:
         """Extract emotion tag from response."""
         pattern = r'\[(\w+)\]\s*$'
@@ -429,7 +501,10 @@ class TextToSpeech:
             print("[PIPER] Not available")
             return False
         try:
-            self.voice = PiperVoice.load(self.voice_name)
+            # Get path relative to this script
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            voice_path = os.path.join(script_dir, f"{self.voice_name}.onnx")
+            self.voice = PiperVoice.load(voice_path)
             print(f"[PIPER] Loaded voice '{self.voice_name}'")
             return True
         except Exception as e:
@@ -442,12 +517,20 @@ class TextToSpeech:
             return np.array([], dtype=np.int16)
 
         audio_data = []
-        for audio_bytes in self.voice.synthesize_stream_raw(text):
-            audio_data.append(np.frombuffer(audio_bytes, dtype=np.int16))
+        for chunk in self.voice.synthesize(text):
+            audio_data.append(chunk.audio_int16_array)
 
-        if audio_data:
-            return np.concatenate(audio_data)
-        return np.array([], dtype=np.int16)
+        if not audio_data:
+            return np.array([], dtype=np.int16)
+
+        audio = np.concatenate(audio_data)
+
+        # Resample from 22050 to 8000 Hz for ESP32 (max buffer time)
+        from scipy import signal
+        num_samples = int(len(audio) * 8000 / 22050)
+        audio = signal.resample(audio, num_samples).astype(np.int16)
+
+        return audio
 
 
 class HinzeHost:
@@ -537,6 +620,7 @@ class HinzeHost:
         self.serial.set_emotion("thinking")
 
         audio = self.serial.audio_buffer.get_audio()
+        self.serial.audio_buffer.clear()  # Clear buffer for next interaction
         transcript = self.recognizer.transcribe(audio)
 
         if not transcript:
@@ -560,12 +644,16 @@ class HinzeHost:
         if PIPER_AVAILABLE and self.tts.voice:
             print("[HOST] Speaking...")
             audio = self.tts.synthesize(response)
-            # TODO: Send audio to ESP32 for playback
-            # For now, just wait a bit
-            time.sleep(len(response) * 0.05)
+            if len(audio) > 0:
+                # Send audio to ESP32 for playback
+                self.serial.start_playback()
+                time.sleep(0.1)  # Wait for ESP32 to enter playback mode
+                self.serial.send_audio(audio)
+                self.serial.stop_playback()
+                print(f"[HOST] Played {len(audio)/8000:.1f}s of audio")
 
         # 5. Return to idle
-        time.sleep(2)
+        time.sleep(1)
         self.serial.set_emotion("idle")
         print("[HOST] === Interaction Complete ===\n")
 
@@ -583,6 +671,7 @@ def main():
         sys.exit(1)
 
     app.run()
+
 
 
 if __name__ == "__main__":

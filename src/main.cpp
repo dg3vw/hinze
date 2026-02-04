@@ -5,6 +5,7 @@
 #include <FastLED.h>
 #include <driver/i2s.h>
 #include <ArduinoJson.h>
+#include <math.h>
 
 // =============================================================================
 // Pin Definitions - ESP32-S3 SuperMini
@@ -33,7 +34,9 @@
 // =============================================================================
 
 #define I2S_PORT_MIC    I2S_NUM_0
+#define I2S_PORT_SPK    I2S_NUM_0  // Use same port as mic (switch RX/TX)
 #define SAMPLE_RATE     16000
+#define SAMPLE_RATE_TTS 8000   // Low rate for speech (max buffer time)
 #define SAMPLE_BITS     16
 #define I2S_BUFFER_SIZE 1024
 #define AUDIO_BUFFER_SIZE 4096
@@ -49,7 +52,8 @@
 enum AudioState {
     AUDIO_IDLE = 0,
     AUDIO_LISTENING,
-    AUDIO_STREAMING
+    AUDIO_STREAMING,
+    AUDIO_PLAYING
 };
 
 AudioState audioState = AUDIO_IDLE;
@@ -169,6 +173,7 @@ void setupDisplay();
 void setupLED();
 void setupButton();
 void setupI2SMic();
+void setupI2SSpk();
 void updateEyes();
 void drawEyes();
 void updateLED();
@@ -183,6 +188,8 @@ void updateAudioCapture();
 void startRecording();
 void stopRecording();
 void streamAudioPacket(int16_t* data, size_t samples);
+void playAudio(int16_t* data, size_t samples);
+void handleAudioInput();
 
 // Eye drawing functions for each emotion
 void drawIdleEyes();
@@ -205,14 +212,15 @@ void drawPupil(int cx, int cy, int eyeH, int offX, int offY);
 // =============================================================================
 
 void setup() {
-    Serial.begin(115200);
+    Serial.setRxBufferSize(16384);  // Large buffer for audio streaming
+    Serial.begin(921600);  // High speed for audio streaming
     while (!Serial && millis() < 3000);
 
     Serial.println();
     Serial.println("=================================");
-    Serial.println("  Hinze Robot Companion v0.5");
+    Serial.println("  Hinze Robot Companion v0.6");
     Serial.println("  ESP32-S3 SuperMini");
-    Serial.println("  I2S Mic + Gain Boost");
+    Serial.println("  I2S Mic + Speaker");
     Serial.println("=================================");
 
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -221,6 +229,7 @@ void setup() {
     setupLED();
     setupButton();
     setupI2SMic();
+    // Note: Speaker I2S is initialized on-demand to avoid bus conflicts
 
     Serial.println("[INIT] Setup complete!");
     sendEvent("ready");
@@ -765,6 +774,126 @@ void setupI2SMic() {
 }
 
 // =============================================================================
+// I2S Speaker Setup
+// =============================================================================
+
+void setupI2SSpk() {
+    Serial.println("[INIT] Setting up I2S speaker...");
+
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = SAMPLE_RATE_TTS,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,  // 32-bit frame
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 16,
+        .dma_buf_len = 1024,
+        .use_apll = false,  // Use default PLL
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
+    };
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCK,
+        .ws_io_num = I2S_WS,
+        .data_out_num = I2S_DOUT,
+        .data_in_num = I2S_PIN_NO_CHANGE
+    };
+
+    esp_err_t err = i2s_driver_install(I2S_PORT_SPK, &i2s_config, 0, NULL);
+    if (err != ESP_OK) {
+        Serial.printf("[I2S] ERROR: Speaker driver install failed: %d\n", err);
+        return;
+    }
+
+    err = i2s_set_pin(I2S_PORT_SPK, &pin_config);
+    if (err != ESP_OK) {
+        Serial.printf("[I2S] ERROR: Speaker pin config failed: %d\n", err);
+        return;
+    }
+
+    Serial.printf("[I2S] Speaker configured: %dHz, 32-bit stereo\n", SAMPLE_RATE_TTS);
+    Serial.printf("[I2S] Pins: WS=%d, BCK=%d, DOUT=%d\n", I2S_WS, I2S_BCK, I2S_DOUT);
+}
+
+// =============================================================================
+// Audio Playback Functions
+// =============================================================================
+
+// Audio buffer for storing received audio before playback
+#define AUDIO_PLAY_BUFFER_SIZE 90000  // ~4 sec at 22050Hz
+static int16_t audioPlayBuffer[AUDIO_PLAY_BUFFER_SIZE];
+static size_t audioPlayBufferPos = 0;
+static bool audioBuffering = true;
+
+void bufferAudio(int16_t* data, size_t samples) {
+    // Buffer audio until we have enough or buffer is full
+    size_t toCopy = min(samples, AUDIO_PLAY_BUFFER_SIZE - audioPlayBufferPos);
+    if (toCopy < samples) {
+        Serial.printf("[WARN] Buffer full! Dropping %d samples\n", samples - toCopy);
+    }
+    memcpy(&audioPlayBuffer[audioPlayBufferPos], data, toCopy * 2);
+    audioPlayBufferPos += toCopy;
+
+    // Show buffer status every ~1 sec of audio
+    static size_t lastReport = 0;
+    if (audioPlayBufferPos - lastReport > 11025) {
+        Serial.printf("[BUF] %d/%d samples (%.1f sec)\n",
+                     audioPlayBufferPos, AUDIO_PLAY_BUFFER_SIZE,
+                     audioPlayBufferPos / 8000.0);
+        lastReport = audioPlayBufferPos;
+    }
+}
+
+void playBufferedAudio() {
+    if (audioPlayBufferPos == 0) return;
+
+    Serial.printf("[AUDIO] Playing %d buffered samples...\n", audioPlayBufferPos);
+    unsigned long startTime = millis();
+
+    int32_t stereoBuffer[512];
+    size_t bytesWritten;
+    size_t offset = 0;
+
+    while (offset < audioPlayBufferPos) {
+        size_t chunk = min(audioPlayBufferPos - offset, (size_t)256);
+
+        for (size_t i = 0; i < chunk; i++) {
+            int32_t sample = audioPlayBuffer[offset + i] * 2;
+            if (sample > 32767) sample = 32767;
+            if (sample < -32768) sample = -32768;
+            sample <<= 16;
+            stereoBuffer[i * 2] = sample;
+            stereoBuffer[i * 2 + 1] = sample;
+        }
+
+        i2s_write(I2S_PORT_SPK, stereoBuffer, chunk * 8, &bytesWritten, portMAX_DELAY);
+        offset += chunk;
+    }
+
+    unsigned long writeTime = millis() - startTime;
+    float expectedMs = audioPlayBufferPos / 8000.0 * 1000.0;
+
+    // Wait for actual playback to complete (DMA still playing after i2s_write returns)
+    if (writeTime < expectedMs) {
+        unsigned long waitTime = (unsigned long)(expectedMs - writeTime) + 200;  // +200ms safety margin
+        Serial.printf("[AUDIO] Waiting %lu ms for playback to finish...\n", waitTime);
+        delay(waitTime);
+    }
+
+    unsigned long totalTime = millis() - startTime;
+    Serial.printf("[AUDIO] Playback done: %lu ms total, %.1f ms audio\n", totalTime, expectedMs);
+
+    audioPlayBufferPos = 0;
+}
+
+void playAudio(int16_t* data, size_t samples) {
+    // Just buffer the audio, don't play yet
+    bufferAudio(data, samples);
+}
+
+// =============================================================================
 // Audio Capture Functions
 // =============================================================================
 
@@ -882,7 +1011,44 @@ void streamAudioPacket(int16_t* data, size_t samples) {
 // Serial Command Handling
 // =============================================================================
 
+// Track last audio packet time for playback timeout
+static unsigned long lastAudioPacketTime = 0;
+
 void handleSerialCommands() {
+    // In playback mode, only process audio packets
+    if (audioState == AUDIO_PLAYING) {
+        // Check for timeout (no audio for 200ms = end of stream)
+        if (lastAudioPacketTime > 0 && millis() - lastAudioPacketTime > 200) {
+            // All audio received, now play it
+            Serial.println("[AUDIO] Buffering complete, starting playback...");
+            playBufferedAudio();
+
+            audioState = AUDIO_IDLE;
+            i2s_driver_uninstall(I2S_PORT_SPK);
+            setupI2SMic();
+            serialBufferIndex = 0;
+            lastAudioPacketTime = 0;
+            extern size_t audioPlayBufferPos;
+            audioPlayBufferPos = 0;  // Reset buffer
+            // Flush any remaining bytes in serial buffer
+            while (Serial.available()) Serial.read();
+            return;
+        }
+
+        while (Serial.available()) {
+            uint8_t b = Serial.peek();
+            if (b == AUDIO_HEADER_1) {
+                handleAudioInput();
+                lastAudioPacketTime = millis();
+            } else {
+                // Skip non-audio bytes
+                Serial.read();
+            }
+        }
+        return;
+    }
+
+    // Normal JSON command handling
     while (Serial.available()) {
         char c = Serial.read();
 
@@ -896,6 +1062,58 @@ void handleSerialCommands() {
             serialBuffer[serialBufferIndex++] = c;
         }
     }
+}
+
+static int audioPacketCount = 0;
+
+void handleAudioInput() {
+    // Read and verify header
+    uint8_t header1 = Serial.read();
+    if (header1 != AUDIO_HEADER_1) return;
+
+    // Wait for second header byte with timeout
+    unsigned long start = millis();
+    while (!Serial.available()) {
+        if (millis() - start > 100) return;
+    }
+    uint8_t header2 = Serial.read();
+    if (header2 != AUDIO_HEADER_2) return;
+
+    // Wait for length bytes
+    while (Serial.available() < 2) {
+        if (millis() - start > 100) return;
+    }
+    uint8_t lenHigh = Serial.read();
+    uint8_t lenLow = Serial.read();
+    uint16_t dataLen = (lenHigh << 8) | lenLow;
+
+    // Sanity check
+    if (dataLen > AUDIO_BUFFER_SIZE * 2) {
+        Serial.printf("{\"error\":\"Audio packet too large: %d\"}\n", dataLen);
+        return;
+    }
+
+    // Read audio data
+    uint16_t bytesRead = 0;
+    while (bytesRead < dataLen) {
+        if (Serial.available()) {
+            ((uint8_t*)audioBuffer)[bytesRead++] = Serial.read();
+        } else if (millis() - start > 1000) {
+            Serial.println("{\"error\":\"Audio read timeout\"}");
+            return;
+        }
+    }
+
+    audioPacketCount++;
+    // Debug: print every 10th packet
+    if (audioPacketCount % 10 == 1) {
+        Serial.printf("[PLAY] Pkt#%d: %d bytes, first samples: %d, %d, %d\n",
+            audioPacketCount, dataLen, audioBuffer[0], audioBuffer[1], audioBuffer[2]);
+    }
+
+    // Play the audio
+    size_t samples = dataLen / 2;  // 16-bit samples
+    playAudio(audioBuffer, samples);
 }
 
 void processCommand(const char* json) {
@@ -940,6 +1158,67 @@ void processCommand(const char* json) {
         } else {
             Serial.println("{\"error\":\"Not recording\"}");
         }
+    }
+    else if (strcmp(cmd, "play_start") == 0) {
+        // Stop mic I2S to free the bus
+        i2s_driver_uninstall(I2S_PORT_MIC);
+        // Initialize speaker I2S
+        setupI2SSpk();
+        audioState = AUDIO_PLAYING;
+        extern unsigned long lastAudioPacketTime;
+        extern int audioPacketCount;
+        extern size_t audioPlayBufferPos;
+        lastAudioPacketTime = millis();  // Initialize timeout
+        audioPacketCount = 0;  // Reset packet counter
+        audioPlayBufferPos = 0;  // Reset audio buffer
+        Serial.println("{\"ok\":true,\"action\":\"play_ready\"}");
+    }
+    else if (strcmp(cmd, "play_stop") == 0) {
+        audioState = AUDIO_IDLE;
+        // Stop speaker I2S
+        i2s_driver_uninstall(I2S_PORT_SPK);
+        // Re-initialize mic I2S
+        setupI2SMic();
+        Serial.println("{\"ok\":true,\"action\":\"play_stopped\"}");
+    }
+    else if (strcmp(cmd, "test_tone") == 0) {
+        // Play alternating tones: beep-beep pattern
+        Serial.println("[TEST] Playing beep pattern (low-high-low-high) 32-bit...");
+        i2s_driver_uninstall(I2S_PORT_MIC);
+        setupI2SSpk();
+
+        int32_t toneBuffer[512];  // 32-bit stereo buffer (L, R, L, R, ...)
+        size_t bytesWritten;
+        float phase = 0.0f;
+        const float PI2 = 6.28318530718f;
+
+        // Play 4 beeps: low, high, low, high (0.5 sec each)
+        float frequencies[] = {400.0f, 800.0f, 400.0f, 800.0f};
+
+        for (int tone = 0; tone < 4; tone++) {
+            float freq = frequencies[tone];
+            float phaseInc = freq / 8000.0f * PI2;
+            phase = 0.0f;
+
+            Serial.printf("[TEST] %.0fHz...\n", freq);
+
+            // 0.5 sec = 8000 samples = 31 buffers of 256 stereo samples
+            for (int repeat = 0; repeat < 31; repeat++) {
+                for (int i = 0; i < 256; i++) {
+                    // 16-bit audio in upper bits of 32-bit word
+                    int32_t sample = (int32_t)(sinf(phase) * 10000) << 16;
+                    toneBuffer[i * 2] = sample;      // Left
+                    toneBuffer[i * 2 + 1] = sample;  // Right
+                    phase += phaseInc;
+                    if (phase >= PI2) phase -= PI2;
+                }
+                i2s_write(I2S_PORT_SPK, toneBuffer, 2048, &bytesWritten, portMAX_DELAY);
+            }
+        }
+
+        i2s_driver_uninstall(I2S_PORT_SPK);
+        setupI2SMic();
+        Serial.println("{\"ok\":true,\"action\":\"test_complete\"}");
     }
     else {
         Serial.printf("{\"error\":\"Unknown command: %s\"}\n", cmd);

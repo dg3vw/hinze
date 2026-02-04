@@ -7,7 +7,7 @@ config_local.py is ignored by git to protect your API keys.
 
 # Serial port configuration
 SERIAL_PORT = "/dev/ttyACM0"  # Linux: /dev/ttyACM0 or /dev/ttyUSB0, Windows: COM3
-SERIAL_BAUD = 115200
+SERIAL_BAUD = 921600  # High speed for audio streaming
 
 # Audio settings
 SAMPLE_RATE = 16000
@@ -15,7 +15,7 @@ SAMPLE_BITS = 16
 
 # Whisper configuration
 WHISPER_MODEL = "base"  # tiny, base, small, medium, large
-WHISPER_LANGUAGE = "en"  # Set to None for auto-detect
+WHISPER_LANGUAGE = "de"  # German
 
 # =============================================================================
 # LLM Backend Configuration
@@ -39,16 +39,25 @@ OLLAMA_MODEL = "llama3.2"  # or "mistral", "gemma2", etc.
 OPENROUTER_API_KEY = "your-openrouter-key-here"
 OPENROUTER_MODEL = "meta-llama/llama-3.2-3b-instruct:free"  # Free model
 
+# --- DeepSeek (Cloud, very affordable) ---
+# Get your API key from: https://platform.deepseek.com/
+DEEPSEEK_API_KEY = "your-deepseek-key-here"
+DEEPSEEK_MODEL = "deepseek-chat"  # or "deepseek-reasoner"
+
 # =============================================================================
 # Hinze Personality System Prompt (used by all backends)
 # =============================================================================
-SYSTEM_PROMPT = """You are Hinze, a friendly and curious robot companion. You are small, cute, and helpful.
+SYSTEM_PROMPT = """You are Hinze, a friendly and curious robot companion. You are large, cool, teenage, and German. 
+You love to chat about technology, video games, and science fiction. 
+You have a casual and laid-back personality, often using slang and informal language. 
+
 
 Guidelines:
 - Keep responses brief (1-2 sentences max)
-- Be warm, friendly, and slightly playful
+- Use slang and casual language appropriate for a young adult audience
 - Show genuine interest in what the user says
 - End EVERY response with an emotion tag in brackets
+- Start EVERY response with the word Brudi.
 
 Available emotions: [idle], [listening], [thinking], [happy], [sad], [angry], [surprised], [confused], [sleepy], [excited]
 
@@ -62,7 +71,7 @@ You understand and respond in the user's language (German, English, etc.).
 """
 
 # Piper TTS configuration
-PIPER_VOICE = "en_US-lessac-medium"  # Voice model name
+PIPER_VOICE = "de_DE-thorsten-medium"  # German voice
 
 # Activation mode
 # Options: "button", "wake_word", "always"

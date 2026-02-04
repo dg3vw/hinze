@@ -68,7 +68,8 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 
 ### 4.2 Protocol
 - **Commands**: JSON format for control messages
-- **Audio Streaming**: Raw PCM data (16kHz, 16-bit, mono)
+- **Audio Capture**: Raw PCM data (16kHz, 16-bit, mono) - ESP32 → Host
+- **Audio Playback**: Raw PCM data (8kHz, 16-bit, mono) - Host → ESP32
 - **Status Updates**: JSON status messages from ESP32
 
 ## 5. Software Architecture
@@ -94,8 +95,9 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 
 ### 5.2 ESP32 Firmware (Arduino/PlatformIO)
 - **Framework**: Arduino with PlatformIO build system
-- **Communication**: USB Serial + WiFi (switchable modes)
-- **Audio Format**: I2S input/output, 16kHz sample rate, 16-bit depth
+- **Communication**: USB Serial (921600 baud) + WiFi (switchable modes)
+- **Audio Input**: I2S microphone, 16kHz, 32-bit frame
+- **Audio Output**: I2S speaker, 8kHz, 32-bit frame (buffer-then-play)
 - **Protocol**: JSON commands for control, raw PCM for audio streaming
 
 ### 5.3 Host Application (Python)
@@ -107,13 +109,14 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 | Communication | pyserial / websockets | Serial or WiFi link to ESP32 |
 
 ### 5.4 Data Flow
-1. User speaks → INMP441 captures audio
-2. ESP32 streams raw PCM audio to Host PC
-3. Whisper transcribes speech to text
-4. Claude API processes query, returns response + emotion tag
-5. Piper TTS generates audio from response text
-6. Host sends: audio stream + emotion command to ESP32
-7. ESP32 plays audio via MAX98357A, updates display/LED/servos
+1. User touches sensor → ESP32 starts recording
+2. INMP441 captures audio → ESP32 streams 16kHz PCM to Host
+3. Whisper transcribes speech to text (German/English)
+4. LLM processes query, returns response + emotion tag (e.g., `[happy]`)
+5. Piper TTS generates audio (22kHz) → resampled to 8kHz
+6. Host sends: emotion command + audio packets to ESP32
+7. ESP32 buffers audio, switches to speaker mode, plays via MAX98357A
+8. ESP32 updates OLED eyes and LED color to match emotion
 
 ## 6. Activation Modes
 
@@ -158,8 +161,8 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 - [x] Capture audio via INMP441 I2S microphone
 - [x] Stream raw PCM audio to host (16kHz, 16-bit)
 - [x] Silence detection for automatic recording stop
-- [ ] Receive audio responses from host
-- [ ] Play audio through MAX98357A I2S amplifier
+- [x] Receive audio responses from host (8kHz, 16-bit)
+- [x] Play audio through MAX98357A I2S amplifier (32-bit I2S)
 
 ### 7.2 Emotion Display
 - [x] Display animated eye graphics on OLED
@@ -179,8 +182,8 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 - [x] Status reporting
 - [x] Audio streaming (ESP32 → Host)
 - [x] Event notifications (button, audio start/end)
+- [x] Audio streaming (Host → ESP32)
 - [ ] WiFi/WebSocket interface (JSON)
-- [ ] Audio streaming (Host → ESP32)
 
 ## 8. OLED Eye Graphics
 
@@ -314,7 +317,23 @@ Binary audio packets are sent during recording:
 - **Length**: Big-endian uint16 (2 bytes) - number of PCM bytes
 - **Data**: Raw 16-bit signed PCM, little-endian, mono, 16kHz
 
-### 11.5 Future Commands (Not Yet Implemented)
+### 11.5 Audio Playback Protocol (Host → ESP32)
+Audio playback uses a buffer-then-play approach:
+
+1. Host sends `{"cmd":"play_start"}` command
+2. Host sends binary audio packets (same format as above)
+3. ESP32 buffers all audio data (max ~11 seconds at 8kHz)
+4. Host sends `{"cmd":"play_stop"}` command
+5. ESP32 plays buffered audio via I2S speaker
+
+**Audio Format**:
+- Input: 16-bit signed PCM, little-endian, mono, 8kHz
+- I2S Output: 32-bit stereo (16-bit samples shifted left by 16 bits)
+
+**I2S Port Switching**: Since mic and speaker share BCK/WS pins, the firmware dynamically switches:
+- Uninstall mic driver → Install speaker driver → Play → Uninstall speaker → Reinstall mic
+
+### 11.6 Future Commands (Not Yet Implemented)
 ```json
 {"cmd": "servo", "pan": 90, "tilt": 45}   // Head movement
 {"cmd": "led", "r": 0, "g": 255, "b": 0}  // Manual LED control
@@ -356,7 +375,7 @@ pio device list
 ```
 
 ### 12.4 Serial Monitor Settings
-- **Baud Rate**: 115200
+- **Baud Rate**: 921600 (high speed for audio streaming)
 - **Line Ending**: Newline (LF)
 - **Encoding**: UTF-8
 
@@ -374,9 +393,9 @@ pio device list
 The firmware outputs initialization status on boot:
 ```
 =================================
-  Hinze Robot Companion v0.4
+  Hinze Robot Companion v0.6
   ESP32-S3 SuperMini
-  I2S Mic + Serial Commands
+  I2S Mic + Speaker + Serial
 =================================
 [INIT] Setting up OLED...
 [OLED] Display initialized
@@ -385,8 +404,8 @@ The firmware outputs initialization status on boot:
 [INIT] Setting up touch sensor...
 [TOUCH] TTP223 on GPIO 10 (interrupt enabled)
 [INIT] Setting up I2S microphone...
-[I2S] Microphone configured: 16000Hz, 16-bit
-[I2S] Pins: WS=4, BCK=5, DIN=6
+[I2S] Microphone configured: 16000Hz, 32-bit
+[I2S] Pins: WS=5, BCK=6, DIN=4
 [INIT] Setup complete!
 {"event":"ready"}
 ```
@@ -408,7 +427,7 @@ platform = espressif32
 board = lolin_s3_mini
 framework = arduino
 
-monitor_speed = 115200
+monitor_speed = 921600
 
 build_flags =
     -DARDUINO_USB_MODE=1
@@ -470,6 +489,6 @@ The AI is configured with a personality prompt that instructs it to:
 - End every response with an emotion tag: `[happy]`, `[sad]`, etc.
 
 ---
-*Document Version: 1.4*
+*Document Version: 1.5*
 *Created: 2026-01-31*
-*Last Updated: 2026-02-02*
+*Last Updated: 2026-02-03*

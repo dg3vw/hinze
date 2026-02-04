@@ -8,6 +8,8 @@
 host/config_local.py
 host/venv/
 host/__pycache__/
+host/*.onnx
+host/*.onnx.json
 
 # IDE
 .vscode/
