@@ -6,6 +6,9 @@
 #include <driver/i2s.h>
 #include <ArduinoJson.h>
 #include <math.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
 
 // =============================================================================
 // Pin Definitions - ESP32-S3 SuperMini
@@ -36,14 +39,67 @@
 #define I2S_PORT_MIC    I2S_NUM_0
 #define I2S_PORT_SPK    I2S_NUM_0  // Use same port as mic (switch RX/TX)
 #define SAMPLE_RATE     16000
-#define SAMPLE_RATE_TTS 8000   // Low rate for speech (max buffer time)
+#define SAMPLE_RATE_TTS 8000   // Low rate for speech
 #define SAMPLE_BITS     16
 #define I2S_BUFFER_SIZE 1024
 #define AUDIO_BUFFER_SIZE 4096
 
-// Audio packet header bytes for serial protocol
+// Audio packet header bytes for protocol
 #define AUDIO_HEADER_1  0xAA
 #define AUDIO_HEADER_2  0x55
+
+// =============================================================================
+// Ring Buffer for Streaming Playback
+// =============================================================================
+
+#define RING_BUFFER_SIZE    8000    // 1 second at 8kHz (16 KB)
+#define PREFILL_SAMPLES     4000    // 0.5 sec prefill before playback starts
+#define REBUFFER_SAMPLES    2000    // 0.25 sec rebuffer after underrun
+#define PLAYBACK_CHUNK_SIZE 256     // Samples per loop iteration (~32ms at 8kHz)
+
+static int16_t ringBuffer[RING_BUFFER_SIZE];
+static volatile size_t ringWritePos = 0;
+static volatile size_t ringReadPos = 0;
+static volatile bool ringStreamEnded = false;  // Host sent play_stop
+
+// Ring buffer helper functions
+static inline size_t ringAvailable() {
+    size_t w = ringWritePos;
+    size_t r = ringReadPos;
+    if (w >= r) return w - r;
+    return RING_BUFFER_SIZE - r + w;
+}
+
+static inline size_t ringFree() {
+    return RING_BUFFER_SIZE - 1 - ringAvailable();
+}
+
+static void ringWrite(const int16_t* data, size_t samples) {
+    size_t free = ringFree();
+    if (samples > free) {
+        samples = free;  // Drop overflow
+    }
+    for (size_t i = 0; i < samples; i++) {
+        ringBuffer[ringWritePos] = data[i];
+        ringWritePos = (ringWritePos + 1) % RING_BUFFER_SIZE;
+    }
+}
+
+static size_t ringRead(int16_t* data, size_t maxSamples) {
+    size_t avail = ringAvailable();
+    if (maxSamples > avail) maxSamples = avail;
+    for (size_t i = 0; i < maxSamples; i++) {
+        data[i] = ringBuffer[ringReadPos];
+        ringReadPos = (ringReadPos + 1) % RING_BUFFER_SIZE;
+    }
+    return maxSamples;
+}
+
+static void ringReset() {
+    ringWritePos = 0;
+    ringReadPos = 0;
+    ringStreamEnded = false;
+}
 
 // =============================================================================
 // Audio State Machine
@@ -53,12 +109,14 @@ enum AudioState {
     AUDIO_IDLE = 0,
     AUDIO_LISTENING,
     AUDIO_STREAMING,
-    AUDIO_PLAYING
+    AUDIO_BUFFERING,     // Receiving audio, prefilling ring buffer
+    AUDIO_PLAYING,       // Streaming playback from ring buffer
+    AUDIO_REBUFFERING    // Underrun recovery, waiting for rebuffer fill
 };
 
 AudioState audioState = AUDIO_IDLE;
 int32_t rawAudioBuffer[AUDIO_BUFFER_SIZE];  // 32-bit buffer for INMP441
-int16_t audioBuffer[AUDIO_BUFFER_SIZE];     // 16-bit buffer for output
+int16_t audioBuffer[AUDIO_BUFFER_SIZE];     // 16-bit buffer for I/O
 unsigned long recordingStartTime = 0;
 #define MAX_RECORDING_MS 10000  // 10 second max recording
 
@@ -72,6 +130,32 @@ unsigned long recordingStartTime = 0;
 
 unsigned long lastSoundTime = 0;
 bool speechDetected = false;
+
+// =============================================================================
+// WiFi + TCP Configuration
+// =============================================================================
+
+#define WIFI_TCP_PORT       8266
+#define WIFI_CONNECT_TIMEOUT_MS 10000
+#define WIFI_NET_TASK_STACK 8192
+
+Preferences preferences;
+WiFiServer tcpServer(WIFI_TCP_PORT);
+WiFiClient tcpClient;
+bool wifiConnected = false;
+bool tcpClientConnected = false;
+
+// Transport: which channel is active for the current session
+enum Transport {
+    TRANSPORT_SERIAL = 0,
+    TRANSPORT_TCP
+};
+Transport activeTransport = TRANSPORT_SERIAL;
+
+// TCP receive buffer (for JSON line assembly on network task)
+#define TCP_BUFFER_SIZE 512
+static char tcpBuffer[TCP_BUFFER_SIZE];
+static int tcpBufferIndex = 0;
 
 // =============================================================================
 // Serial Command Buffer
@@ -174,22 +258,28 @@ void setupLED();
 void setupButton();
 void setupI2SMic();
 void setupI2SSpk();
+void setupWiFi();
 void updateEyes();
 void drawEyes();
 void updateLED();
 void handleButton();
 void updateIdleBehavior();
 void handleSerialCommands();
-void processCommand(const char* json);
+void handleSerialInput();
+void processCommand(const char* json, Transport source);
 void setEmotionByName(const char* name);
-void sendStatus();
+void sendStatus(Transport source);
+void sendResponse(const char* json, Transport source);
 void sendEvent(const char* event, const char* action = nullptr);
 void updateAudioCapture();
 void startRecording();
 void stopRecording();
 void streamAudioPacket(int16_t* data, size_t samples);
-void playAudio(int16_t* data, size_t samples);
-void handleAudioInput();
+void handleAudioInput(Stream& stream);
+void updateStreamingPlayback();
+void startPlaybackMode(Transport source);
+void stopPlaybackMode();
+void wifiNetTask(void* param);
 
 // Eye drawing functions for each emotion
 void drawIdleEyes();
@@ -218,9 +308,9 @@ void setup() {
 
     Serial.println();
     Serial.println("=================================");
-    Serial.println("  Hinze Robot Companion v0.6");
+    Serial.println("  Hinze Robot Companion v0.7");
     Serial.println("  ESP32-S3 SuperMini");
-    Serial.println("  I2S Mic + Speaker");
+    Serial.println("  WiFi Streaming Audio");
     Serial.println("=================================");
 
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -229,20 +319,21 @@ void setup() {
     setupLED();
     setupButton();
     setupI2SMic();
-    // Note: Speaker I2S is initialized on-demand to avoid bus conflicts
+    setupWiFi();
 
     Serial.println("[INIT] Setup complete!");
     sendEvent("ready");
 }
 
 // =============================================================================
-// Main Loop
+// Main Loop (Core 1) - Eyes/LED/Buttons/Playback
 // =============================================================================
 
 void loop() {
-    handleSerialCommands();
+    handleSerialInput();
     handleButton();
     updateAudioCapture();
+    updateStreamingPlayback();
 
     if (currentEmotion == EMOTION_IDLE && audioState == AUDIO_IDLE) {
         updateIdleBehavior();
@@ -272,11 +363,162 @@ void setupDisplay() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(30, 28);
-    display.print("Hinze v0.5");
+    display.print("Hinze v0.7");
     display.display();
     delay(1000);
 
     Serial.println("[OLED] Display initialized");
+}
+
+// =============================================================================
+// WiFi Setup
+// =============================================================================
+
+void setupWiFi() {
+    preferences.begin("hinze", true);  // read-only
+    String ssid = preferences.getString("wifi_ssid", "");
+    String pass = preferences.getString("wifi_pass", "");
+    preferences.end();
+
+    if (ssid.length() == 0) {
+        Serial.println("[WIFI] No credentials stored. Use wifi_config command to set.");
+        Serial.println("[WIFI] Running in serial-only mode.");
+        return;
+    }
+
+    Serial.printf("[WIFI] Connecting to '%s'...\n", ssid.c_str());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+
+    unsigned long startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+        // Start mDNS
+        if (MDNS.begin("hinze")) {
+            MDNS.addService("hinze", "tcp", WIFI_TCP_PORT);
+            Serial.printf("[WIFI] mDNS: hinze.local:%d\n", WIFI_TCP_PORT);
+        }
+
+        // Start TCP server
+        tcpServer.begin();
+        tcpServer.setNoDelay(true);
+        Serial.printf("[WIFI] TCP server listening on port %d\n", WIFI_TCP_PORT);
+
+        // Launch network task on core 0
+        xTaskCreatePinnedToCore(
+            wifiNetTask,
+            "wifiNet",
+            WIFI_NET_TASK_STACK,
+            NULL,
+            1,          // Priority
+            NULL,
+            0           // Core 0
+        );
+        Serial.println("[WIFI] Network task started on core 0");
+    } else {
+        Serial.println("[WIFI] Connection failed. Running in serial-only mode.");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+    }
+}
+
+// =============================================================================
+// WiFi Network Task (Core 0) - TCP server + audio receive
+// =============================================================================
+
+void wifiNetTask(void* param) {
+    Serial.println("[NET] WiFi network task running on core 0");
+
+    while (true) {
+        // Accept new client if none connected
+        if (!tcpClientConnected) {
+            WiFiClient newClient = tcpServer.available();
+            if (newClient) {
+                tcpClient = newClient;
+                tcpClient.setNoDelay(true);
+                tcpClientConnected = true;
+                tcpBufferIndex = 0;
+                Serial.printf("[NET] Client connected from %s\n",
+                             tcpClient.remoteIP().toString().c_str());
+            }
+        }
+
+        // Handle connected client
+        if (tcpClientConnected) {
+            if (!tcpClient.connected()) {
+                Serial.println("[NET] Client disconnected");
+                tcpClientConnected = false;
+                tcpClient.stop();
+                // If we were playing via TCP, stop
+                if (activeTransport == TRANSPORT_TCP &&
+                    (audioState == AUDIO_BUFFERING || audioState == AUDIO_PLAYING || audioState == AUDIO_REBUFFERING)) {
+                    ringStreamEnded = true;
+                }
+                activeTransport = TRANSPORT_SERIAL;
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+                continue;
+            }
+
+            // Read available data from TCP
+            while (tcpClient.available()) {
+                uint8_t b = tcpClient.peek();
+
+                // Check for audio packet header
+                if (b == AUDIO_HEADER_1 &&
+                    (audioState == AUDIO_BUFFERING || audioState == AUDIO_PLAYING || audioState == AUDIO_REBUFFERING)) {
+                    handleAudioInput(tcpClient);
+                } else {
+                    // JSON line assembly
+                    char c = tcpClient.read();
+                    if (c == '\n' || c == '\r') {
+                        if (tcpBufferIndex > 0) {
+                            tcpBuffer[tcpBufferIndex] = '\0';
+                            processCommand(tcpBuffer, TRANSPORT_TCP);
+                            tcpBufferIndex = 0;
+                        }
+                    } else if (tcpBufferIndex < TCP_BUFFER_SIZE - 1) {
+                        tcpBuffer[tcpBufferIndex++] = c;
+                    }
+                }
+            }
+        }
+
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // Yield to other tasks
+    }
+}
+
+// =============================================================================
+// Transport Abstraction
+// =============================================================================
+
+void sendResponse(const char* json, Transport source) {
+    if (source == TRANSPORT_TCP && tcpClientConnected) {
+        tcpClient.println(json);
+    } else {
+        Serial.println(json);
+    }
+}
+
+void sendEvent(const char* event, const char* action) {
+    char buf[128];
+    if (action) {
+        snprintf(buf, sizeof(buf), "{\"event\":\"%s\",\"action\":\"%s\"}", event, action);
+    } else {
+        snprintf(buf, sizeof(buf), "{\"event\":\"%s\"}", event);
+    }
+    // Send events on both transports so host always sees them
+    Serial.println(buf);
+    if (tcpClientConnected) {
+        tcpClient.println(buf);
+    }
 }
 
 // =============================================================================
@@ -818,79 +1060,100 @@ void setupI2SSpk() {
 }
 
 // =============================================================================
-// Audio Playback Functions
+// Streaming Playback - Non-blocking, ring buffer based
 // =============================================================================
 
-// Audio buffer for storing received audio before playback
-#define AUDIO_PLAY_BUFFER_SIZE 90000  // ~4 sec at 22050Hz
-static int16_t audioPlayBuffer[AUDIO_PLAY_BUFFER_SIZE];
-static size_t audioPlayBufferPos = 0;
-static bool audioBuffering = true;
+static int audioPacketCount = 0;
 
-void bufferAudio(int16_t* data, size_t samples) {
-    // Buffer audio until we have enough or buffer is full
-    size_t toCopy = min(samples, AUDIO_PLAY_BUFFER_SIZE - audioPlayBufferPos);
-    if (toCopy < samples) {
-        Serial.printf("[WARN] Buffer full! Dropping %d samples\n", samples - toCopy);
-    }
-    memcpy(&audioPlayBuffer[audioPlayBufferPos], data, toCopy * 2);
-    audioPlayBufferPos += toCopy;
+void startPlaybackMode(Transport source) {
+    // Switch from mic to speaker I2S
+    i2s_driver_uninstall(I2S_PORT_MIC);
+    setupI2SSpk();
 
-    // Show buffer status every ~1 sec of audio
-    static size_t lastReport = 0;
-    if (audioPlayBufferPos - lastReport > 11025) {
-        Serial.printf("[BUF] %d/%d samples (%.1f sec)\n",
-                     audioPlayBufferPos, AUDIO_PLAY_BUFFER_SIZE,
-                     audioPlayBufferPos / 8000.0);
-        lastReport = audioPlayBufferPos;
-    }
+    ringReset();
+    audioPacketCount = 0;
+    activeTransport = source;
+    audioState = AUDIO_BUFFERING;
+
+    char resp[] = "{\"ok\":true,\"action\":\"play_ready\"}";
+    sendResponse(resp, source);
+    Serial.println("[AUDIO] Playback mode: buffering...");
 }
 
-void playBufferedAudio() {
-    if (audioPlayBufferPos == 0) return;
+void stopPlaybackMode() {
+    Serial.printf("[AUDIO] Playback complete. %d packets received.\n", audioPacketCount);
+    audioState = AUDIO_IDLE;
+    i2s_driver_uninstall(I2S_PORT_SPK);
+    setupI2SMic();
+}
 
-    Serial.printf("[AUDIO] Playing %d buffered samples...\n", audioPlayBufferPos);
-    unsigned long startTime = millis();
+void updateStreamingPlayback() {
+    // Only run in playback-related states
+    if (audioState != AUDIO_BUFFERING && audioState != AUDIO_PLAYING && audioState != AUDIO_REBUFFERING) {
+        return;
+    }
 
-    int32_t stereoBuffer[512];
-    size_t bytesWritten;
-    size_t offset = 0;
+    size_t avail = ringAvailable();
 
-    while (offset < audioPlayBufferPos) {
-        size_t chunk = min(audioPlayBufferPos - offset, (size_t)256);
-
-        for (size_t i = 0; i < chunk; i++) {
-            int32_t sample = audioPlayBuffer[offset + i] * 2;
-            if (sample > 32767) sample = 32767;
-            if (sample < -32768) sample = -32768;
-            sample <<= 16;
-            stereoBuffer[i * 2] = sample;
-            stereoBuffer[i * 2 + 1] = sample;
+    // BUFFERING: wait for prefill before starting playback
+    if (audioState == AUDIO_BUFFERING) {
+        if (avail >= PREFILL_SAMPLES || (ringStreamEnded && avail > 0)) {
+            Serial.printf("[AUDIO] Prefill complete (%d samples), starting playback\n", avail);
+            audioState = AUDIO_PLAYING;
+        } else if (ringStreamEnded && avail == 0) {
+            // Stream ended before we got any audio
+            Serial.println("[AUDIO] Stream ended with no audio");
+            stopPlaybackMode();
+            return;
         }
-
-        i2s_write(I2S_PORT_SPK, stereoBuffer, chunk * 8, &bytesWritten, portMAX_DELAY);
-        offset += chunk;
+        return;  // Don't play yet
     }
 
-    unsigned long writeTime = millis() - startTime;
-    float expectedMs = audioPlayBufferPos / 8000.0 * 1000.0;
-
-    // Wait for actual playback to complete (DMA still playing after i2s_write returns)
-    if (writeTime < expectedMs) {
-        unsigned long waitTime = (unsigned long)(expectedMs - writeTime) + 200;  // +200ms safety margin
-        Serial.printf("[AUDIO] Waiting %lu ms for playback to finish...\n", waitTime);
-        delay(waitTime);
+    // REBUFFERING: wait for partial refill after underrun
+    if (audioState == AUDIO_REBUFFERING) {
+        if (avail >= REBUFFER_SAMPLES || (ringStreamEnded && avail > 0)) {
+            Serial.printf("[AUDIO] Rebuffer complete (%d samples), resuming\n", avail);
+            audioState = AUDIO_PLAYING;
+        } else if (ringStreamEnded && avail == 0) {
+            Serial.println("[AUDIO] Stream ended during rebuffer");
+            stopPlaybackMode();
+            return;
+        }
+        return;
     }
 
-    unsigned long totalTime = millis() - startTime;
-    Serial.printf("[AUDIO] Playback done: %lu ms total, %.1f ms audio\n", totalTime, expectedMs);
+    // PLAYING: feed I2S from ring buffer
+    if (avail == 0) {
+        if (ringStreamEnded) {
+            // All audio played
+            Serial.println("[AUDIO] Ring buffer drained, playback done");
+            stopPlaybackMode();
+            return;
+        }
+        // Underrun - need to rebuffer
+        Serial.println("[AUDIO] Buffer underrun, rebuffering...");
+        audioState = AUDIO_REBUFFERING;
+        return;
+    }
 
-    audioPlayBufferPos = 0;
-}
+    // Read up to PLAYBACK_CHUNK_SIZE samples from ring buffer
+    int16_t playChunk[PLAYBACK_CHUNK_SIZE];
+    size_t toPlay = min(avail, (size_t)PLAYBACK_CHUNK_SIZE);
+    size_t got = ringRead(playChunk, toPlay);
 
-void playAudio(int16_t* data, size_t samples) {
-    // Just buffer the audio, don't play yet
-    bufferAudio(data, samples);
+    // Convert to 32-bit stereo for I2S
+    int32_t stereoBuffer[PLAYBACK_CHUNK_SIZE * 2];
+    for (size_t i = 0; i < got; i++) {
+        int32_t sample = (int32_t)playChunk[i] * 2;
+        if (sample > 32767) sample = 32767;
+        if (sample < -32768) sample = -32768;
+        sample <<= 16;
+        stereoBuffer[i * 2] = sample;
+        stereoBuffer[i * 2 + 1] = sample;
+    }
+
+    size_t bytesWritten;
+    i2s_write(I2S_PORT_SPK, stereoBuffer, got * 8, &bytesWritten, 10 / portTICK_PERIOD_MS);
 }
 
 // =============================================================================
@@ -954,12 +1217,9 @@ void updateAudioCapture() {
         size_t samplesRead = bytesRead / sizeof(int32_t);
 
         // Convert 32-bit to 16-bit (INMP441 data is in upper 24 bits, left-justified)
-        // Shift right by 14 to get 18 bits, then take lower 16 bits
         for (size_t i = 0; i < samplesRead; i++) {
             int32_t sample = rawAudioBuffer[i] >> 14;  // Extract upper bits
-            // Apply small gain if needed
             sample = sample * MIC_GAIN;
-            // Clamp to 16-bit range
             if (sample > 32767) sample = 32767;
             if (sample < -32768) sample = -32768;
             audioBuffer[i] = (int16_t)sample;
@@ -1000,49 +1260,119 @@ void streamAudioPacket(int16_t* data, size_t samples) {
     // Send audio packet with header: [0xAA][0x55][len_high][len_low][pcm_data...]
     size_t dataBytes = samples * sizeof(int16_t);
 
+    // Always send mic audio via serial (mic capture is always serial-initiated for now)
     Serial.write(AUDIO_HEADER_1);
     Serial.write(AUDIO_HEADER_2);
     Serial.write((uint8_t)(dataBytes >> 8));
     Serial.write((uint8_t)(dataBytes & 0xFF));
     Serial.write((uint8_t*)data, dataBytes);
+
+    // Also send via TCP if client connected
+    if (tcpClientConnected) {
+        uint8_t header[4] = {
+            AUDIO_HEADER_1,
+            AUDIO_HEADER_2,
+            (uint8_t)(dataBytes >> 8),
+            (uint8_t)(dataBytes & 0xFF)
+        };
+        tcpClient.write(header, 4);
+        tcpClient.write((uint8_t*)data, dataBytes);
+    }
+}
+
+// =============================================================================
+// Audio Input Handling (from Serial or TCP stream)
+// =============================================================================
+
+void handleAudioInput(Stream& stream) {
+    // Read and verify header
+    uint8_t header1 = stream.read();
+    if (header1 != AUDIO_HEADER_1) return;
+
+    // Wait for second header byte with timeout
+    unsigned long start = millis();
+    while (!stream.available()) {
+        if (millis() - start > 100) return;
+        delay(1);
+    }
+    uint8_t header2 = stream.read();
+    if (header2 != AUDIO_HEADER_2) return;
+
+    // Wait for length bytes
+    while (stream.available() < 2) {
+        if (millis() - start > 100) return;
+        delay(1);
+    }
+    uint8_t lenHigh = stream.read();
+    uint8_t lenLow = stream.read();
+    uint16_t dataLen = (lenHigh << 8) | lenLow;
+
+    // Sanity check
+    if (dataLen > AUDIO_BUFFER_SIZE * 2) {
+        Serial.printf("[AUDIO] Packet too large: %d bytes\n", dataLen);
+        return;
+    }
+
+    // Read audio data into temp buffer
+    uint16_t bytesRead = 0;
+    while (bytesRead < dataLen) {
+        if (stream.available()) {
+            ((uint8_t*)audioBuffer)[bytesRead++] = stream.read();
+        } else if (millis() - start > 1000) {
+            Serial.println("[AUDIO] Read timeout");
+            return;
+        } else {
+            delay(1);
+        }
+    }
+
+    audioPacketCount++;
+    if (audioPacketCount % 20 == 1) {
+        Serial.printf("[PLAY] Pkt#%d: %d bytes, ring: %d/%d\n",
+            audioPacketCount, dataLen, ringAvailable(), RING_BUFFER_SIZE);
+    }
+
+    // Write to ring buffer
+    size_t samples = dataLen / 2;
+    ringWrite(audioBuffer, samples);
 }
 
 // =============================================================================
 // Serial Command Handling
 // =============================================================================
 
-// Track last audio packet time for playback timeout
-static unsigned long lastAudioPacketTime = 0;
-
-void handleSerialCommands() {
-    // In playback mode, only process audio packets
-    if (audioState == AUDIO_PLAYING) {
-        // Check for timeout (no audio for 200ms = end of stream)
-        if (lastAudioPacketTime > 0 && millis() - lastAudioPacketTime > 200) {
-            // All audio received, now play it
-            Serial.println("[AUDIO] Buffering complete, starting playback...");
-            playBufferedAudio();
-
-            audioState = AUDIO_IDLE;
-            i2s_driver_uninstall(I2S_PORT_SPK);
-            setupI2SMic();
-            serialBufferIndex = 0;
-            lastAudioPacketTime = 0;
-            extern size_t audioPlayBufferPos;
-            audioPlayBufferPos = 0;  // Reset buffer
-            // Flush any remaining bytes in serial buffer
-            while (Serial.available()) Serial.read();
-            return;
-        }
+void handleSerialInput() {
+    // In playback mode via serial, handle audio packets
+    if (activeTransport == TRANSPORT_SERIAL &&
+        (audioState == AUDIO_BUFFERING || audioState == AUDIO_PLAYING || audioState == AUDIO_REBUFFERING)) {
 
         while (Serial.available()) {
             uint8_t b = Serial.peek();
             if (b == AUDIO_HEADER_1) {
-                handleAudioInput();
-                lastAudioPacketTime = millis();
+                handleAudioInput(Serial);
+            } else if (b == '{') {
+                // Could be a JSON command (like play_stop) - parse it
+                char c = Serial.read();
+                serialBuffer[0] = c;
+                serialBufferIndex = 1;
+                // Read until newline
+                unsigned long start = millis();
+                while (millis() - start < 100) {
+                    if (Serial.available()) {
+                        c = Serial.read();
+                        if (c == '\n' || c == '\r') {
+                            serialBuffer[serialBufferIndex] = '\0';
+                            processCommand(serialBuffer, TRANSPORT_SERIAL);
+                            serialBufferIndex = 0;
+                            break;
+                        } else if (serialBufferIndex < SERIAL_BUFFER_SIZE - 1) {
+                            serialBuffer[serialBufferIndex++] = c;
+                        }
+                    }
+                }
+                serialBufferIndex = 0;
             } else {
-                // Skip non-audio bytes
-                Serial.read();
+                Serial.read();  // Skip non-audio, non-JSON bytes
             }
         }
         return;
@@ -1055,7 +1385,7 @@ void handleSerialCommands() {
         if (c == '\n' || c == '\r') {
             if (serialBufferIndex > 0) {
                 serialBuffer[serialBufferIndex] = '\0';
-                processCommand(serialBuffer);
+                processCommand(serialBuffer, TRANSPORT_SERIAL);
                 serialBufferIndex = 0;
             }
         } else if (serialBufferIndex < SERIAL_BUFFER_SIZE - 1) {
@@ -1064,70 +1394,20 @@ void handleSerialCommands() {
     }
 }
 
-static int audioPacketCount = 0;
-
-void handleAudioInput() {
-    // Read and verify header
-    uint8_t header1 = Serial.read();
-    if (header1 != AUDIO_HEADER_1) return;
-
-    // Wait for second header byte with timeout
-    unsigned long start = millis();
-    while (!Serial.available()) {
-        if (millis() - start > 100) return;
-    }
-    uint8_t header2 = Serial.read();
-    if (header2 != AUDIO_HEADER_2) return;
-
-    // Wait for length bytes
-    while (Serial.available() < 2) {
-        if (millis() - start > 100) return;
-    }
-    uint8_t lenHigh = Serial.read();
-    uint8_t lenLow = Serial.read();
-    uint16_t dataLen = (lenHigh << 8) | lenLow;
-
-    // Sanity check
-    if (dataLen > AUDIO_BUFFER_SIZE * 2) {
-        Serial.printf("{\"error\":\"Audio packet too large: %d\"}\n", dataLen);
-        return;
-    }
-
-    // Read audio data
-    uint16_t bytesRead = 0;
-    while (bytesRead < dataLen) {
-        if (Serial.available()) {
-            ((uint8_t*)audioBuffer)[bytesRead++] = Serial.read();
-        } else if (millis() - start > 1000) {
-            Serial.println("{\"error\":\"Audio read timeout\"}");
-            return;
-        }
-    }
-
-    audioPacketCount++;
-    // Debug: print every 10th packet
-    if (audioPacketCount % 10 == 1) {
-        Serial.printf("[PLAY] Pkt#%d: %d bytes, first samples: %d, %d, %d\n",
-            audioPacketCount, dataLen, audioBuffer[0], audioBuffer[1], audioBuffer[2]);
-    }
-
-    // Play the audio
-    size_t samples = dataLen / 2;  // 16-bit samples
-    playAudio(audioBuffer, samples);
-}
-
-void processCommand(const char* json) {
+void processCommand(const char* json, Transport source) {
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, json);
 
     if (error) {
-        Serial.printf("{\"error\":\"JSON parse failed: %s\"}\n", error.c_str());
+        char buf[128];
+        snprintf(buf, sizeof(buf), "{\"error\":\"JSON parse failed: %s\"}", error.c_str());
+        sendResponse(buf, source);
         return;
     }
 
     const char* cmd = doc["cmd"];
     if (!cmd) {
-        Serial.println("{\"error\":\"Missing cmd field\"}");
+        sendResponse("{\"error\":\"Missing cmd field\"}", source);
         return;
     }
 
@@ -1135,51 +1415,73 @@ void processCommand(const char* json) {
         const char* state = doc["state"];
         if (state) {
             setEmotionByName(state);
-            Serial.printf("{\"ok\":true,\"emotion\":\"%s\"}\n", state);
+            char buf[64];
+            snprintf(buf, sizeof(buf), "{\"ok\":true,\"emotion\":\"%s\"}", state);
+            sendResponse(buf, source);
         } else {
-            Serial.println("{\"error\":\"Missing state field\"}");
+            sendResponse("{\"error\":\"Missing state field\"}", source);
         }
     }
     else if (strcmp(cmd, "status") == 0) {
-        sendStatus();
+        sendStatus(source);
     }
     else if (strcmp(cmd, "record_start") == 0) {
         if (audioState == AUDIO_IDLE) {
             startRecording();
-            Serial.println("{\"ok\":true,\"action\":\"recording\"}");
+            sendResponse("{\"ok\":true,\"action\":\"recording\"}", source);
         } else {
-            Serial.println("{\"error\":\"Already recording\"}");
+            sendResponse("{\"error\":\"Already recording\"}", source);
         }
     }
     else if (strcmp(cmd, "record_stop") == 0) {
         if (audioState == AUDIO_STREAMING) {
             stopRecording();
-            Serial.println("{\"ok\":true,\"action\":\"stopped\"}");
+            sendResponse("{\"ok\":true,\"action\":\"stopped\"}", source);
         } else {
-            Serial.println("{\"error\":\"Not recording\"}");
+            sendResponse("{\"error\":\"Not recording\"}", source);
         }
     }
     else if (strcmp(cmd, "play_start") == 0) {
-        // Stop mic I2S to free the bus
-        i2s_driver_uninstall(I2S_PORT_MIC);
-        // Initialize speaker I2S
-        setupI2SSpk();
-        audioState = AUDIO_PLAYING;
-        extern unsigned long lastAudioPacketTime;
-        extern int audioPacketCount;
-        extern size_t audioPlayBufferPos;
-        lastAudioPacketTime = millis();  // Initialize timeout
-        audioPacketCount = 0;  // Reset packet counter
-        audioPlayBufferPos = 0;  // Reset audio buffer
-        Serial.println("{\"ok\":true,\"action\":\"play_ready\"}");
+        if (audioState == AUDIO_IDLE) {
+            startPlaybackMode(source);
+        } else {
+            sendResponse("{\"error\":\"Not idle\"}", source);
+        }
     }
     else if (strcmp(cmd, "play_stop") == 0) {
-        audioState = AUDIO_IDLE;
-        // Stop speaker I2S
-        i2s_driver_uninstall(I2S_PORT_SPK);
-        // Re-initialize mic I2S
-        setupI2SMic();
-        Serial.println("{\"ok\":true,\"action\":\"play_stopped\"}");
+        // Signal end of stream - playback continues until ring drains
+        ringStreamEnded = true;
+        sendResponse("{\"ok\":true,\"action\":\"stream_ended\"}", source);
+        Serial.println("[AUDIO] Stream end marker set");
+    }
+    else if (strcmp(cmd, "wifi_config") == 0) {
+        const char* ssid = doc["ssid"];
+        const char* pass = doc["pass"];
+        if (ssid) {
+            preferences.begin("hinze", false);  // read-write
+            preferences.putString("wifi_ssid", ssid);
+            preferences.putString("wifi_pass", pass ? pass : "");
+            preferences.end();
+            char buf[128];
+            snprintf(buf, sizeof(buf), "{\"ok\":true,\"action\":\"wifi_saved\",\"ssid\":\"%s\"}", ssid);
+            sendResponse(buf, source);
+            Serial.printf("[WIFI] Credentials saved. Reboot to connect.\n");
+        } else {
+            sendResponse("{\"error\":\"Missing ssid field\"}", source);
+        }
+    }
+    else if (strcmp(cmd, "wifi_status") == 0) {
+        char buf[256];
+        if (wifiConnected) {
+            snprintf(buf, sizeof(buf),
+                "{\"ok\":true,\"wifi\":\"connected\",\"ip\":\"%s\",\"rssi\":%d,\"tcp_client\":%s}",
+                WiFi.localIP().toString().c_str(),
+                WiFi.RSSI(),
+                tcpClientConnected ? "true" : "false");
+        } else {
+            snprintf(buf, sizeof(buf), "{\"ok\":true,\"wifi\":\"disconnected\"}");
+        }
+        sendResponse(buf, source);
     }
     else if (strcmp(cmd, "test_tone") == 0) {
         // Play alternating tones: beep-beep pattern
@@ -1205,7 +1507,6 @@ void processCommand(const char* json) {
             // 0.5 sec = 8000 samples = 31 buffers of 256 stereo samples
             for (int repeat = 0; repeat < 31; repeat++) {
                 for (int i = 0; i < 256; i++) {
-                    // 16-bit audio in upper bits of 32-bit word
                     int32_t sample = (int32_t)(sinf(phase) * 10000) << 16;
                     toneBuffer[i * 2] = sample;      // Left
                     toneBuffer[i * 2 + 1] = sample;  // Right
@@ -1218,10 +1519,12 @@ void processCommand(const char* json) {
 
         i2s_driver_uninstall(I2S_PORT_SPK);
         setupI2SMic();
-        Serial.println("{\"ok\":true,\"action\":\"test_complete\"}");
+        sendResponse("{\"ok\":true,\"action\":\"test_complete\"}", source);
     }
     else {
-        Serial.printf("{\"error\":\"Unknown command: %s\"}\n", cmd);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "{\"error\":\"Unknown command: %s\"}", cmd);
+        sendResponse(buf, source);
     }
 }
 
@@ -1243,22 +1546,21 @@ void setEmotionByName(const char* name) {
     animationFrame = 0;
 }
 
-void sendStatus() {
+void sendStatus(Transport source) {
     const char* emotionNames[] = {
         "idle", "listening", "thinking", "happy", "sad",
         "angry", "surprised", "confused", "sleepy", "excited"
     };
-    const char* audioStateNames[] = {"idle", "listening", "streaming"};
+    const char* audioStateNames[] = {
+        "idle", "listening", "streaming", "buffering", "playing", "rebuffering"
+    };
 
-    Serial.printf("{\"status\":\"ok\",\"version\":\"0.5\",\"emotion\":\"%s\",\"audio\":\"%s\"}\n",
-                  emotionNames[currentEmotion],
-                  audioStateNames[audioState]);
-}
-
-void sendEvent(const char* event, const char* action) {
-    if (action) {
-        Serial.printf("{\"event\":\"%s\",\"action\":\"%s\"}\n", event, action);
-    } else {
-        Serial.printf("{\"event\":\"%s\"}\n", event);
-    }
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"status\":\"ok\",\"version\":\"0.7\",\"emotion\":\"%s\",\"audio\":\"%s\",\"wifi\":\"%s\",\"ring_buf\":%d}",
+        emotionNames[currentEmotion],
+        audioStateNames[audioState],
+        wifiConnected ? "connected" : "disconnected",
+        ringAvailable());
+    sendResponse(buf, source);
 }

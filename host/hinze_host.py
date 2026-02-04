@@ -2,22 +2,26 @@
 """
 Hinze Robot Companion - Host Application
 
-This application connects to the Hinze ESP32 robot via serial,
-handles speech recognition (Whisper), AI responses (Claude),
-and text-to-speech (Piper).
+This application connects to the Hinze ESP32 robot via serial or TCP,
+handles speech recognition (Whisper), AI responses (Claude/Ollama/etc),
+and text-to-speech (Piper) with streaming audio playback.
 
 Usage:
     python hinze_host.py [--port /dev/ttyACM0]
+    python hinze_host.py --tcp [--host hinze.local]
+    python hinze_host.py --serial
 """
 
 import argparse
 import json
 import os
 import re
+import socket
 import struct
 import sys
 import threading
 import time
+from abc import ABC, abstractmethod
 from queue import Queue, Empty
 
 import numpy as np
@@ -100,81 +104,74 @@ class AudioBuffer:
             return len(self.samples) / self.sample_rate
 
 
-class SerialHandler:
-    """Handles serial communication with ESP32."""
+class ConnectionHandler(ABC):
+    """Abstract base class for ESP32 connections."""
 
     HEADER_1 = 0xAA
     HEADER_2 = 0x55
 
-    def __init__(self, port: str, baud: int = SERIAL_BAUD):
-        self.port = port
-        self.baud = baud
-        self.serial = None
+    def __init__(self):
         self.running = False
         self.event_queue = Queue()
         self.audio_buffer = AudioBuffer()
         self.read_thread = None
 
+    @abstractmethod
     def connect(self) -> bool:
-        """Connect to serial port."""
-        try:
-            self.serial = serial.Serial(self.port, self.baud, timeout=0.1)
-            time.sleep(2)  # Wait for ESP32 reset
-            self.serial.reset_input_buffer()
-            print(f"[SERIAL] Connected to {self.port}")
-            return True
-        except serial.SerialException as e:
-            print(f"[SERIAL] Error connecting: {e}")
-            return False
+        pass
 
+    @abstractmethod
     def disconnect(self):
-        """Disconnect from serial port."""
-        self.running = False
-        if self.read_thread:
-            self.read_thread.join(timeout=1.0)
-        if self.serial:
-            self.serial.close()
-            self.serial = None
-        print("[SERIAL] Disconnected")
+        pass
+
+    @abstractmethod
+    def _write_bytes(self, data: bytes):
+        pass
+
+    @abstractmethod
+    def _read_byte(self) -> bytes:
+        pass
+
+    @abstractmethod
+    def _read_bytes(self, count: int) -> bytes:
+        pass
+
+    @abstractmethod
+    def _available(self) -> bool:
+        pass
 
     def start_reading(self):
-        """Start background thread to read serial data."""
+        """Start background thread to read data."""
         self.running = True
         self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self.read_thread.start()
 
     def _read_loop(self):
-        """Background thread: read serial data."""
+        """Background thread: read data from connection."""
         json_buffer = ""
 
-        while self.running and self.serial:
+        while self.running:
             try:
-                # Check for audio packet header
-                byte = self.serial.read(1)
+                byte = self._read_byte()
                 if not byte:
                     continue
 
                 if byte[0] == self.HEADER_1:
-                    # Possible audio packet
-                    byte2 = self.serial.read(1)
+                    byte2 = self._read_byte()
                     if byte2 and byte2[0] == self.HEADER_2:
-                        # Read length (2 bytes, big-endian)
-                        len_bytes = self.serial.read(2)
+                        len_bytes = self._read_bytes(2)
                         if len(len_bytes) == 2:
                             data_len = (len_bytes[0] << 8) | len_bytes[1]
-                            # Read audio data
-                            audio_data = self.serial.read(data_len)
+                            audio_data = self._read_bytes(data_len)
                             if len(audio_data) == data_len:
                                 self.audio_buffer.add_samples(audio_data)
                                 if DEBUG:
                                     print(f"[AUDIO] Received {data_len} bytes", end='\r')
                     else:
-                        # Not an audio packet, treat as JSON
                         json_buffer += chr(byte[0])
                         if byte2:
                             json_buffer += chr(byte2[0])
                 else:
-                    # Regular character (JSON)
                     char = chr(byte[0])
                     if char == '\n':
                         if json_buffer.strip():
@@ -183,12 +180,13 @@ class SerialHandler:
                     else:
                         json_buffer += char
 
-            except serial.SerialException as e:
-                print(f"[SERIAL] Read error: {e}")
+            except Exception as e:
+                if self.running:
+                    print(f"[CONN] Read error: {e}")
                 break
 
     def _process_json(self, line: str):
-        """Process a JSON line from serial."""
+        """Process a JSON line."""
         try:
             data = json.loads(line)
             if "event" in data:
@@ -203,53 +201,40 @@ class SerialHandler:
 
     def send_command(self, cmd: dict):
         """Send a JSON command to ESP32."""
-        if self.serial:
-            json_str = json.dumps(cmd) + "\n"
-            self.serial.write(json_str.encode())
-            if DEBUG:
-                print(f"[SEND] {cmd}")
+        json_str = json.dumps(cmd) + "\n"
+        self._write_bytes(json_str.encode())
+        if DEBUG:
+            print(f"[SEND] {cmd}")
 
     def set_emotion(self, emotion: str):
-        """Set emotion on ESP32."""
         self.send_command({"cmd": "emotion", "state": emotion})
 
     def get_status(self):
-        """Request status from ESP32."""
         self.send_command({"cmd": "status"})
 
     def start_recording(self):
-        """Start audio recording."""
         self.audio_buffer.clear()
         self.send_command({"cmd": "record_start"})
 
     def stop_recording(self):
-        """Stop audio recording."""
         self.send_command({"cmd": "record_stop"})
 
     def start_playback(self):
-        """Start audio playback mode."""
         self.send_command({"cmd": "play_start"})
 
     def stop_playback(self):
-        """Stop audio playback mode."""
         self.send_command({"cmd": "play_stop"})
 
     def send_audio(self, audio: np.ndarray, chunk_size: int = 1024):
         """Send audio data to ESP32 for playback."""
-        if not self.serial:
-            return
-
-        # Convert to int16 if needed
         if audio.dtype != np.int16:
             audio = (audio * 32767).astype(np.int16)
 
-        # Send in chunks
         for i in range(0, len(audio), chunk_size):
             chunk = audio[i:i + chunk_size]
             data = chunk.tobytes()
             data_len = len(data)
 
-            # Send packet: header + length + data
             packet = bytes([
                 self.HEADER_1,
                 self.HEADER_2,
@@ -257,8 +242,7 @@ class SerialHandler:
                 data_len & 0xFF
             ]) + data
 
-            self.serial.write(packet)
-            time.sleep(0.01)  # Short delay, let ESP32 buffer
+            self._write_bytes(packet)
 
     def wait_for_event(self, event_name: str, timeout: float = 10.0) -> dict | None:
         """Wait for a specific event."""
@@ -273,6 +257,154 @@ class SerialHandler:
         return None
 
 
+class SerialHandler(ConnectionHandler):
+    """Handles serial communication with ESP32."""
+
+    def __init__(self, port: str, baud: int = SERIAL_BAUD):
+        super().__init__()
+        self.port = port
+        self.baud = baud
+        self.serial = None
+
+    def connect(self) -> bool:
+        try:
+            self.serial = serial.Serial(self.port, self.baud, timeout=0.1)
+            time.sleep(2)  # Wait for ESP32 reset
+            self.serial.reset_input_buffer()
+            print(f"[SERIAL] Connected to {self.port}")
+            return True
+        except serial.SerialException as e:
+            print(f"[SERIAL] Error connecting: {e}")
+            return False
+
+    def disconnect(self):
+        self.running = False
+        if self.read_thread:
+            self.read_thread.join(timeout=1.0)
+        if self.serial:
+            self.serial.close()
+            self.serial = None
+        print("[SERIAL] Disconnected")
+
+    def _write_bytes(self, data: bytes):
+        if self.serial:
+            self.serial.write(data)
+
+    def _read_byte(self) -> bytes:
+        if self.serial:
+            return self.serial.read(1)
+        return b''
+
+    def _read_bytes(self, count: int) -> bytes:
+        if self.serial:
+            return self.serial.read(count)
+        return b''
+
+    def _available(self) -> bool:
+        return self.serial and self.serial.in_waiting > 0
+
+    def send_audio(self, audio: np.ndarray, chunk_size: int = 1024):
+        """Send audio data with serial pacing."""
+        if audio.dtype != np.int16:
+            audio = (audio * 32767).astype(np.int16)
+
+        for i in range(0, len(audio), chunk_size):
+            chunk = audio[i:i + chunk_size]
+            data = chunk.tobytes()
+            data_len = len(data)
+
+            packet = bytes([
+                self.HEADER_1,
+                self.HEADER_2,
+                (data_len >> 8) & 0xFF,
+                data_len & 0xFF
+            ]) + data
+
+            self._write_bytes(packet)
+            time.sleep(0.01)  # Serial needs pacing
+
+
+class TCPHandler(ConnectionHandler):
+    """Handles TCP communication with ESP32."""
+
+    def __init__(self, host: str = None, port: int = None):
+        super().__init__()
+        self.host = host or getattr(sys.modules[__name__], 'ESP32_HOST', 'hinze.local')
+        self.port = port or getattr(sys.modules[__name__], 'ESP32_PORT', 8266)
+        self.sock = None
+        self.sock_file = None
+        self._lock = threading.Lock()
+
+    def connect(self) -> bool:
+        try:
+            print(f"[TCP] Connecting to {self.host}:{self.port}...")
+            self.sock = socket.create_connection((self.host, self.port), timeout=5.0)
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock.settimeout(0.1)
+            self.sock_file = self.sock.makefile('rb')
+            print(f"[TCP] Connected to {self.host}:{self.port}")
+            return True
+        except (socket.error, OSError) as e:
+            print(f"[TCP] Error connecting: {e}")
+            return False
+
+    def disconnect(self):
+        self.running = False
+        if self.read_thread:
+            self.read_thread.join(timeout=1.0)
+        if self.sock_file:
+            try:
+                self.sock_file.close()
+            except:
+                pass
+            self.sock_file = None
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
+        print("[TCP] Disconnected")
+
+    def _write_bytes(self, data: bytes):
+        with self._lock:
+            if self.sock:
+                try:
+                    self.sock.sendall(data)
+                except (socket.error, OSError) as e:
+                    print(f"[TCP] Write error: {e}")
+
+    def _read_byte(self) -> bytes:
+        try:
+            if self.sock:
+                data = self.sock.recv(1)
+                return data if data else b''
+        except socket.timeout:
+            return b''
+        except (socket.error, OSError):
+            return b''
+        return b''
+
+    def _read_bytes(self, count: int) -> bytes:
+        if not self.sock:
+            return b''
+        data = b''
+        while len(data) < count:
+            try:
+                chunk = self.sock.recv(count - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            except socket.timeout:
+                continue
+            except (socket.error, OSError):
+                break
+        return data
+
+    def _available(self) -> bool:
+        return self.sock is not None
+
+
 class SpeechRecognizer:
     """Transcribes audio using Whisper."""
 
@@ -281,7 +413,6 @@ class SpeechRecognizer:
         self.model_name = model_name
 
     def load(self):
-        """Load Whisper model."""
         if not WHISPER_AVAILABLE:
             print("[WHISPER] Not available")
             return False
@@ -291,7 +422,6 @@ class SpeechRecognizer:
         return True
 
     def transcribe(self, audio: np.ndarray) -> str:
-        """Transcribe audio to text."""
         if not self.model:
             return ""
         result = self.model.transcribe(
@@ -311,7 +441,6 @@ class ConversationEngine:
         self.conversation_history = []
 
     def connect(self) -> bool:
-        """Initialize LLM client based on configured backend."""
         try:
             backend = self.backend
         except:
@@ -346,7 +475,6 @@ class ConversationEngine:
             print("[OLLAMA] Not available - install: pip install ollama")
             return False
         try:
-            # Test connection by listing models
             ollama.list()
             print(f"[OLLAMA] Connected to {OLLAMA_HOST}")
             return True
@@ -387,7 +515,6 @@ class ConversationEngine:
 
     def chat(self, user_message: str) -> tuple[str, str]:
         """Send message to LLM, get response and emotion."""
-        # Add user message to history
         self.conversation_history.append({
             "role": "user",
             "content": user_message
@@ -410,13 +537,11 @@ class ConversationEngine:
             else:
                 return "I don't know how to think.", "confused"
 
-            # Add assistant response to history
             self.conversation_history.append({
                 "role": "assistant",
                 "content": response
             })
 
-            # Keep only last 3 turns (6 messages: 3 user + 3 assistant)
             if len(self.conversation_history) > 6:
                 self.conversation_history = self.conversation_history[-6:]
 
@@ -436,7 +561,6 @@ class ConversationEngine:
         return response.content[0].text
 
     def _chat_ollama(self) -> str:
-        # Build messages with system prompt
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self.conversation_history)
 
@@ -447,7 +571,6 @@ class ConversationEngine:
         return response['message']['content']
 
     def _chat_openrouter(self) -> str:
-        # Build messages with system prompt
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self.conversation_history)
 
@@ -459,7 +582,6 @@ class ConversationEngine:
         return response.choices[0].message.content
 
     def _chat_deepseek(self) -> str:
-        # Build messages with system prompt
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self.conversation_history)
 
@@ -471,7 +593,6 @@ class ConversationEngine:
         return response.choices[0].message.content
 
     def _extract_emotion(self, text: str) -> tuple[str, str]:
-        """Extract emotion tag from response."""
         pattern = r'\[(\w+)\]\s*$'
         match = re.search(pattern, text)
 
@@ -496,12 +617,10 @@ class TextToSpeech:
         self.voice = None
 
     def load(self) -> bool:
-        """Load Piper voice model."""
         if not PIPER_AVAILABLE:
             print("[PIPER] Not available")
             return False
         try:
-            # Get path relative to this script
             script_dir = os.path.dirname(os.path.abspath(__file__))
             voice_path = os.path.join(script_dir, f"{self.voice_name}.onnx")
             self.voice = PiperVoice.load(voice_path)
@@ -512,7 +631,7 @@ class TextToSpeech:
             return False
 
     def synthesize(self, text: str) -> np.ndarray:
-        """Generate audio from text."""
+        """Generate all audio from text at once (legacy)."""
         if not self.voice:
             return np.array([], dtype=np.int16)
 
@@ -525,45 +644,104 @@ class TextToSpeech:
 
         audio = np.concatenate(audio_data)
 
-        # Resample from 22050 to 8000 Hz for ESP32 (max buffer time)
         from scipy import signal
         num_samples = int(len(audio) * 8000 / 22050)
         audio = signal.resample(audio, num_samples).astype(np.int16)
 
         return audio
 
+    def synthesize_streaming(self, text: str):
+        """Generate audio chunks as they become available (generator).
+
+        Yields resampled int16 numpy arrays at 8kHz.
+        """
+        if not self.voice:
+            return
+
+        from scipy import signal
+
+        for chunk in self.voice.synthesize(text):
+            raw = chunk.audio_int16_array
+            if len(raw) == 0:
+                continue
+            # Resample from 22050 to 8000 Hz
+            num_samples = int(len(raw) * 8000 / 22050)
+            if num_samples == 0:
+                continue
+            resampled = signal.resample(raw, num_samples).astype(np.int16)
+            yield resampled
+
 
 class HinzeHost:
     """Main application class."""
 
-    def __init__(self, port: str):
-        self.serial = SerialHandler(port)
+    def __init__(self, connection_mode: str, serial_port: str, tcp_host: str = None, tcp_port: int = None):
+        self.connection_mode = connection_mode
+        self.serial_port = serial_port
+        self.tcp_host = tcp_host
+        self.tcp_port = tcp_port
+        self.conn = None  # Will be set during setup
         self.recognizer = SpeechRecognizer()
         self.conversation = ConversationEngine()
         self.tts = TextToSpeech()
         self.running = False
 
+    def _create_connection(self) -> ConnectionHandler | None:
+        """Create connection based on mode."""
+        if self.connection_mode == "tcp":
+            handler = TCPHandler(self.tcp_host, self.tcp_port)
+            if handler.connect():
+                return handler
+            print("[HOST] TCP connection failed")
+            return None
+
+        elif self.connection_mode == "serial":
+            handler = SerialHandler(self.serial_port)
+            if handler.connect():
+                return handler
+            print("[HOST] Serial connection failed")
+            return None
+
+        else:  # auto mode
+            # Try TCP first
+            print("[HOST] Auto mode: trying TCP first...")
+            handler = TCPHandler(self.tcp_host, self.tcp_port)
+            if handler.connect():
+                print("[HOST] Using TCP connection")
+                return handler
+
+            # Fall back to serial
+            print("[HOST] TCP unavailable, trying serial...")
+            handler = SerialHandler(self.serial_port)
+            if handler.connect():
+                print("[HOST] Using serial connection")
+                return handler
+
+            print("[HOST] No connection available")
+            return None
+
     def setup(self) -> bool:
         """Initialize all components."""
-        print("\n=== Hinze Host Application ===\n")
+        print("\n=== Hinze Host Application v0.7 ===\n")
 
-        # Connect to ESP32
-        if not self.serial.connect():
+        # Create connection
+        self.conn = self._create_connection()
+        if not self.conn:
             return False
 
-        # Start serial reading
-        self.serial.start_reading()
+        # Start reading
+        self.conn.start_reading()
 
         # Wait for ready event
         print("[HOST] Waiting for ESP32 ready...")
-        event = self.serial.wait_for_event("ready", timeout=5.0)
+        event = self.conn.wait_for_event("ready", timeout=5.0)
         if not event:
             print("[HOST] Warning: No ready event received")
 
         # Load speech recognition
         self.recognizer.load()
 
-        # Connect to Claude
+        # Connect to LLM
         self.conversation.connect()
 
         # Load TTS
@@ -577,12 +755,11 @@ class HinzeHost:
     def run(self):
         """Main loop."""
         self.running = True
-        self.serial.set_emotion("idle")
+        self.conn.set_emotion("idle")
 
         try:
             while self.running:
-                # Wait for button press event
-                event = self.serial.wait_for_event("button", timeout=1.0)
+                event = self.conn.wait_for_event("button", timeout=1.0)
 
                 if event and event.get("action") == "press":
                     self._handle_interaction()
@@ -590,81 +767,107 @@ class HinzeHost:
         except KeyboardInterrupt:
             print("\n[HOST] Shutting down...")
 
-        self.serial.disconnect()
+        self.conn.disconnect()
 
     def _handle_interaction(self):
-        """Handle a complete interaction cycle."""
+        """Handle a complete interaction cycle with streaming TTS."""
         print("\n[HOST] === New Interaction ===")
 
-        # 1. Recording phase (button already triggered recording on ESP32)
+        # 1. Recording phase
         print("[HOST] Recording... (press button to stop)")
-        self.serial.set_emotion("listening")
+        self.conn.set_emotion("listening")
 
-        # Wait for audio_end event
-        event = self.serial.wait_for_event("audio_end", timeout=RECORDING_TIMEOUT)
+        event = self.conn.wait_for_event("audio_end", timeout=RECORDING_TIMEOUT)
         if not event:
             print("[HOST] Recording timeout")
-            self.serial.stop_recording()
+            self.conn.stop_recording()
 
-        # Get audio duration
-        duration = self.serial.audio_buffer.duration()
+        duration = self.conn.audio_buffer.duration()
         print(f"[HOST] Captured {duration:.1f}s of audio")
 
         if duration < 0.5:
             print("[HOST] Audio too short, ignoring")
-            self.serial.set_emotion("idle")
+            self.conn.set_emotion("idle")
             return
 
         # 2. Transcription phase
         print("[HOST] Transcribing...")
-        self.serial.set_emotion("thinking")
+        self.conn.set_emotion("thinking")
 
-        audio = self.serial.audio_buffer.get_audio()
-        self.serial.audio_buffer.clear()  # Clear buffer for next interaction
+        audio = self.conn.audio_buffer.get_audio()
+        self.conn.audio_buffer.clear()
         transcript = self.recognizer.transcribe(audio)
 
         if not transcript:
             print("[HOST] No speech detected")
-            self.serial.set_emotion("confused")
+            self.conn.set_emotion("confused")
             time.sleep(1)
-            self.serial.set_emotion("idle")
+            self.conn.set_emotion("idle")
             return
 
         print(f"[HOST] Transcript: \"{transcript}\"")
 
-        # 3. Get Claude response
+        # 3. Get LLM response
         print("[HOST] Thinking...")
         response, emotion = self.conversation.chat(transcript)
         print(f"[HOST] Response: \"{response}\" [{emotion}]")
 
-        # 4. Set emotion and speak
-        self.serial.set_emotion(emotion)
+        # 4. Set emotion and stream TTS
+        self.conn.set_emotion(emotion)
 
-        # Generate and play TTS (if available)
         if PIPER_AVAILABLE and self.tts.voice:
-            print("[HOST] Speaking...")
-            audio = self.tts.synthesize(response)
-            if len(audio) > 0:
-                # Send audio to ESP32 for playback
-                self.serial.start_playback()
-                time.sleep(0.1)  # Wait for ESP32 to enter playback mode
-                self.serial.send_audio(audio)
-                self.serial.stop_playback()
-                print(f"[HOST] Played {len(audio)/8000:.1f}s of audio")
+            print("[HOST] Streaming TTS...")
+            self.conn.start_playback()
+            time.sleep(0.1)  # Wait for ESP32 to enter playback mode
+
+            total_samples = 0
+            for chunk in self.tts.synthesize_streaming(response):
+                self.conn.send_audio(chunk)
+                total_samples += len(chunk)
+
+            # Signal end of stream - ESP32 will play until ring buffer drains
+            self.conn.stop_playback()
+            print(f"[HOST] Streamed {total_samples/8000:.1f}s of audio")
 
         # 5. Return to idle
         time.sleep(1)
-        self.serial.set_emotion("idle")
+        self.conn.set_emotion("idle")
         print("[HOST] === Interaction Complete ===\n")
 
 
 def main():
+    # Get defaults from config
+    default_mode = getattr(sys.modules[__name__], 'CONNECTION_MODE', 'auto')
+    default_host = getattr(sys.modules[__name__], 'ESP32_HOST', 'hinze.local')
+    default_port = getattr(sys.modules[__name__], 'ESP32_PORT', 8266)
+
     parser = argparse.ArgumentParser(description="Hinze Robot Companion Host")
     parser.add_argument("--port", "-p", default=SERIAL_PORT,
                         help=f"Serial port (default: {SERIAL_PORT})")
+    parser.add_argument("--tcp", action="store_true",
+                        help="Force TCP connection")
+    parser.add_argument("--serial", action="store_true",
+                        help="Force serial connection")
+    parser.add_argument("--host", default=default_host,
+                        help=f"ESP32 hostname or IP (default: {default_host})")
+    parser.add_argument("--tcp-port", type=int, default=default_port,
+                        help=f"ESP32 TCP port (default: {default_port})")
     args = parser.parse_args()
 
-    app = HinzeHost(args.port)
+    # Determine connection mode
+    if args.tcp:
+        mode = "tcp"
+    elif args.serial:
+        mode = "serial"
+    else:
+        mode = default_mode
+
+    app = HinzeHost(
+        connection_mode=mode,
+        serial_port=args.port,
+        tcp_host=args.host,
+        tcp_port=args.tcp_port
+    )
 
     if not app.setup():
         print("[HOST] Setup failed!")

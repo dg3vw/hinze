@@ -63,14 +63,16 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 ## 4. Communication
 
 ### 4.1 Host Connection
-- **USB Serial** - Primary connection for development and reliable operation
-- **WiFi** - Wireless mode for standalone deployment
+- **USB Serial** - Primary connection for development and reliable operation (921600 baud)
+- **WiFi TCP** - Wireless mode via TCP server on port 8266, mDNS as `hinze.local`
+- **Auto mode** - Host tries TCP first, falls back to serial
 
 ### 4.2 Protocol
-- **Commands**: JSON format for control messages
+- **Commands**: JSON format for control messages (same protocol over serial and TCP)
 - **Audio Capture**: Raw PCM data (16kHz, 16-bit, mono) - ESP32 → Host
-- **Audio Playback**: Raw PCM data (8kHz, 16-bit, mono) - Host → ESP32
+- **Audio Playback**: Raw PCM data (8kHz, 16-bit, mono) - Host → ESP32 (streaming via ring buffer)
 - **Status Updates**: JSON status messages from ESP32
+- **WiFi Config**: Credentials stored in NVS via `wifi_config` command
 
 ## 5. Software Architecture
 
@@ -97,8 +99,10 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 - **Framework**: Arduino with PlatformIO build system
 - **Communication**: USB Serial (921600 baud) + WiFi (switchable modes)
 - **Audio Input**: I2S microphone, 16kHz, 32-bit frame
-- **Audio Output**: I2S speaker, 8kHz, 32-bit frame (buffer-then-play)
+- **Audio Output**: I2S speaker, 8kHz, 32-bit frame (streaming via ring buffer)
 - **Protocol**: JSON commands for control, raw PCM for audio streaming
+- **WiFi**: STA mode, TCP server on port 8266, FreeRTOS task on core 0
+- **Dual-core**: Core 0 = network task, Core 1 = animation/playback loop
 
 ### 5.3 Host Application (Python)
 | Component | Technology | Purpose |
@@ -113,10 +117,10 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 2. INMP441 captures audio → ESP32 streams 16kHz PCM to Host
 3. Whisper transcribes speech to text (German/English)
 4. LLM processes query, returns response + emotion tag (e.g., `[happy]`)
-5. Piper TTS generates audio (22kHz) → resampled to 8kHz
-6. Host sends: emotion command + audio packets to ESP32
-7. ESP32 buffers audio, switches to speaker mode, plays via MAX98357A
-8. ESP32 updates OLED eyes and LED color to match emotion
+5. Piper TTS generates audio chunks (22kHz) → resampled to 8kHz in real-time
+6. Host streams: emotion command + audio packets to ESP32 (serial or TCP)
+7. ESP32 fills ring buffer, starts playback after 0.5s prefill
+8. ESP32 plays via MAX98357A while eyes/LED continue animating (non-blocking)
 
 ## 6. Activation Modes
 
@@ -183,7 +187,10 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 - [x] Audio streaming (ESP32 → Host)
 - [x] Event notifications (button, audio start/end)
 - [x] Audio streaming (Host → ESP32)
-- [ ] WiFi/WebSocket interface (JSON)
+- [x] WiFi TCP interface (same protocol as serial)
+- [x] Transport abstraction (serial/TCP auto-detection)
+- [x] NVS-stored WiFi credentials
+- [x] mDNS service discovery (hinze.local)
 
 ## 8. OLED Eye Graphics
 
@@ -317,27 +324,50 @@ Binary audio packets are sent during recording:
 - **Length**: Big-endian uint16 (2 bytes) - number of PCM bytes
 - **Data**: Raw 16-bit signed PCM, little-endian, mono, 16kHz
 
-### 11.5 Audio Playback Protocol (Host → ESP32)
-Audio playback uses a buffer-then-play approach:
+### 11.5 Audio Streaming Playback Protocol (Host → ESP32)
+Audio playback uses a streaming ring buffer approach with no duration limit:
 
-1. Host sends `{"cmd":"play_start"}` command
-2. Host sends binary audio packets (same format as above)
-3. ESP32 buffers all audio data (max ~11 seconds at 8kHz)
-4. Host sends `{"cmd":"play_stop"}` command
-5. ESP32 plays buffered audio via I2S speaker
+1. Host sends `{"cmd":"play_start"}` → ESP32 switches to speaker I2S, enters BUFFERING state
+2. Host streams binary audio packets (same format as above, 8kHz)
+3. ESP32 writes incoming audio to ring buffer (8,000 samples = 1 sec)
+4. After 0.5s prefill (4,000 samples), ESP32 starts playback (PLAYING state)
+5. ESP32 reads 256 samples per loop iteration → I2S (non-blocking, ~30 FPS maintained)
+6. Host sends `{"cmd":"play_stop"}` → sets stream-end marker
+7. ESP32 plays until ring buffer drains, then switches back to mic
 
 **Audio Format**:
 - Input: 16-bit signed PCM, little-endian, mono, 8kHz
 - I2S Output: 32-bit stereo (16-bit samples shifted left by 16 bits)
 
-**I2S Port Switching**: Since mic and speaker share BCK/WS pins, the firmware dynamically switches:
-- Uninstall mic driver → Install speaker driver → Play → Uninstall speaker → Reinstall mic
+**Ring Buffer**:
+- Size: 8,000 samples (16 KB)
+- Prefill threshold: 4,000 samples (0.5 sec)
+- Underrun recovery: rebuffer 2,000 samples (0.25 sec)
+- No maximum duration limit (streaming)
 
-### 11.6 Future Commands (Not Yet Implemented)
+**I2S Port Switching**: Since mic and speaker share BCK/WS pins, the firmware dynamically switches:
+- Uninstall mic driver → Install speaker driver → Stream/Play → Uninstall speaker → Reinstall mic
+
+### 11.6 WiFi/TCP Protocol
+The same JSON + binary packet protocol works over TCP (port 8266). Additional commands:
+
+```json
+{"cmd": "wifi_config", "ssid": "...", "pass": "..."}  // Store WiFi credentials in NVS
+{"cmd": "wifi_status"}                                  // Get WiFi connection info
+```
+
+WiFi features:
+- STA mode with auto-connect on boot
+- mDNS registration as `hinze.local`
+- TCP server on port 8266 (single client)
+- FreeRTOS task on core 0 handles network I/O
+- Core 1 handles animation and I2S playback
+- WiFi failure is non-fatal (serial fallback)
+
+### 11.7 Future Commands (Not Yet Implemented)
 ```json
 {"cmd": "servo", "pan": 90, "tilt": 45}   // Head movement
 {"cmd": "led", "r": 0, "g": 255, "b": 0}  // Manual LED control
-{"cmd": "audio_play"}                      // Play audio (followed by PCM data)
 ```
 
 ## 12. Development & Debugging
@@ -393,9 +423,9 @@ pio device list
 The firmware outputs initialization status on boot:
 ```
 =================================
-  Hinze Robot Companion v0.6
+  Hinze Robot Companion v0.7
   ESP32-S3 SuperMini
-  I2S Mic + Speaker + Serial
+  WiFi Streaming Audio
 =================================
 [INIT] Setting up OLED...
 [OLED] Display initialized
@@ -404,8 +434,13 @@ The firmware outputs initialization status on boot:
 [INIT] Setting up touch sensor...
 [TOUCH] TTP223 on GPIO 10 (interrupt enabled)
 [INIT] Setting up I2S microphone...
-[I2S] Microphone configured: 16000Hz, 32-bit
+[I2S] Microphone configured: 16000Hz, 16-bit
 [I2S] Pins: WS=5, BCK=6, DIN=4
+[WIFI] Connecting to 'MyNetwork'...
+[WIFI] Connected! IP: 192.168.1.42
+[WIFI] mDNS: hinze.local:8266
+[WIFI] TCP server listening on port 8266
+[WIFI] Network task started on core 0
 [INIT] Setup complete!
 {"event":"ready"}
 ```
@@ -468,7 +503,13 @@ python3 -m venv venv           # Create virtual environment
 source venv/bin/activate       # Activate venv (Linux/macOS)
 pip install -r requirements.txt
 cp config.py config_local.py   # Edit with your API key
-python hinze_host.py --port /dev/ttyACM0
+
+# Connection modes:
+python hinze_host.py              # Auto: try TCP first, fall back to serial
+python hinze_host.py --tcp        # Force TCP connection
+python hinze_host.py --serial     # Force serial connection
+python hinze_host.py --host 192.168.1.42  # Specific IP address
+python hinze_host.py --port /dev/ttyACM0  # Specific serial port
 ```
 
 **Note**: On first run, Whisper will download the model (~140MB for "base").
@@ -476,11 +517,13 @@ python hinze_host.py --port /dev/ttyACM0
 ### 13.4 Host Components
 | Component | Class | Purpose |
 |-----------|-------|---------|
-| Serial Handler | `SerialHandler` | Manages ESP32 connection, parses packets |
+| Connection Handler | `ConnectionHandler` | Abstract base class for serial/TCP |
+| Serial Handler | `SerialHandler` | Serial connection (inherits ConnectionHandler) |
+| TCP Handler | `TCPHandler` | WiFi TCP connection (inherits ConnectionHandler) |
 | Audio Buffer | `AudioBuffer` | Collects incoming PCM samples |
 | Speech Recognition | `SpeechRecognizer` | Whisper transcription |
-| Conversation | `ConversationEngine` | Claude API with emotion extraction |
-| Text-to-Speech | `TextToSpeech` | Piper TTS audio generation |
+| Conversation | `ConversationEngine` | Multi-backend LLM with emotion extraction |
+| Text-to-Speech | `TextToSpeech` | Piper TTS with streaming synthesis |
 
 ### 13.5 Claude System Prompt
 The AI is configured with a personality prompt that instructs it to:
@@ -489,6 +532,6 @@ The AI is configured with a personality prompt that instructs it to:
 - End every response with an emotion tag: `[happy]`, `[sad]`, etc.
 
 ---
-*Document Version: 1.5*
+*Document Version: 1.6*
 *Created: 2026-01-31*
-*Last Updated: 2026-02-03*
+*Last Updated: 2026-02-04*

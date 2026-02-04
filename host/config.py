@@ -5,9 +5,19 @@ Copy this file to config_local.py and edit your settings there.
 config_local.py is ignored by git to protect your API keys.
 """
 
-# Serial port configuration
+# =============================================================================
+# Connection Configuration
+# =============================================================================
+# CONNECTION_MODE: "auto" (try TCP then serial), "tcp", or "serial"
+CONNECTION_MODE = "auto"
+
+# Serial settings
 SERIAL_PORT = "/dev/ttyACM0"  # Linux: /dev/ttyACM0 or /dev/ttyUSB0, Windows: COM3
 SERIAL_BAUD = 921600  # High speed for audio streaming
+
+# TCP/WiFi settings
+ESP32_HOST = "hinze.local"  # mDNS name or IP address
+ESP32_PORT = 8266            # TCP port on ESP32
 
 # Audio settings
 SAMPLE_RATE = 16000
