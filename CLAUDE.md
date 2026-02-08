@@ -53,7 +53,7 @@ Interactive robot companion with ESP32-S3, featuring voice interaction via host 
 - ✅ Full voice interaction loop complete!
 
 ### Firmware Version
-**v0.7** - WiFi Streaming Audio
+**v0.8** - RoboEyes Pure (no overlays)
 
 ## Architecture
 ```
@@ -159,18 +159,20 @@ python hinze_host.py
 ```
 
 ## Implemented Emotions
-| # | Emotion | Eyes | LED |
-|---|---------|------|-----|
-| 0 | Idle | Look around + blink | Rainbow cycle |
-| 1 | Listening | Wide, pulsing | Blue pulse |
-| 2 | Thinking | Squinted, dots "..." | Yellow pulse |
-| 3 | Happy | Curved ^ ^ | Green |
-| 4 | Sad | Droopy + tear | Blue |
-| 5 | Angry | Narrow + brows | Red |
-| 6 | Surprised | Wide, tiny pupils | White |
-| 7 | Confused | Asymmetric + "?" | Purple |
-| 8 | Sleepy | Half-closed + "Zzz" | Dim orange |
-| 9 | Excited | Bouncy + sparkles | Fast rainbow |
+All emotions use RoboEyes moods/sizes/positions exclusively (no custom overlays).
+
+| # | Emotion | Eyes (RoboEyes) | LED |
+|---|---------|-----------------|-----|
+| 0 | Idle | Default + autoblink + idle look-around | Rainbow cycle |
+| 1 | Listening | Large (40x40), round | Blue pulse |
+| 2 | Thinking | Small squinted (30x24), looking NW | Yellow pulse |
+| 3 | Happy | HAPPY mood + autoblink | Green |
+| 4 | Sad | TIRED mood, shorter (28h), looking S | Blue |
+| 5 | Angry | ANGRY mood, wide+narrow (40x24) | Red |
+| 6 | Surprised | Very large round (44x44) | White |
+| 7 | Confused | Asymmetric sizes + anim_confused() | Purple |
+| 8 | Sleepy | TIRED mood, very short (16h) + autoblink | Dim orange |
+| 9 | Excited | HAPPY mood, large (40x40) + periodic anim_laugh() | Fast rainbow |
 
 ## Next Steps
 1. ~~Add OLED display library and test eye graphics~~ (done)

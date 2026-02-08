@@ -9,6 +9,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <FluxGarage_RoboEyes.h>
 
 // Forward declarations
 void playbackTask(void* param);
@@ -238,32 +239,11 @@ enum Emotion {
 Emotion currentEmotion = EMOTION_IDLE;
 
 // =============================================================================
-// Eye Configuration
+// RoboEyes + Animation State
 // =============================================================================
 
-#define EYE_WIDTH       40
-#define EYE_HEIGHT      40
-#define EYE_SPACING     48
-#define PUPIL_SIZE      10
-#define PUPIL_MAX_OFFSET 8
-
-// Eye state
-float pupilX = 0.0;
-float pupilY = 0.0;
-float targetPupilX = 0.0;
-float targetPupilY = 0.0;
-
-// Blink state
-bool isBlinking = false;
-int blinkFrame = 0;
-#define BLINK_FRAMES    4
-
-// Animation state
-unsigned long lastLookChange = 0;
-unsigned long lastBlink = 0;
-unsigned long nextLookInterval = 2000;
-unsigned long nextBlinkInterval = 3000;
-unsigned long animationFrame = 0;
+RoboEyes<Adafruit_SSD1306> roboEyes(display);
+Emotion lastAppliedEmotion = EMOTION_IDLE;  // Track emotion changes
 
 // =============================================================================
 // Function Prototypes
@@ -275,11 +255,9 @@ void setupButton();
 void setupI2SMic();
 void setupI2SSpk();
 void setupWiFi();
-void updateEyes();
-void drawEyes();
+void applyEmotion();
 void updateLED();
 void handleButton();
-void updateIdleBehavior();
 void handleSerialCommands();
 void handleSerialInput();
 void processCommand(const char* json, Transport source);
@@ -297,22 +275,6 @@ void startPlaybackMode(Transport source);
 void stopPlaybackMode();
 void wifiNetTask(void* param);
 
-// Eye drawing functions for each emotion
-void drawIdleEyes();
-void drawListeningEyes();
-void drawThinkingEyes();
-void drawHappyEyes();
-void drawSadEyes();
-void drawAngryEyes();
-void drawSurprisedEyes();
-void drawConfusedEyes();
-void drawSleepyEyes();
-void drawExcitedEyes();
-
-// Helper functions
-void drawRoundEye(int cx, int cy, int w, int h, int pupilOffX, int pupilOffY, int cornerRadius);
-void drawPupil(int cx, int cy, int eyeH, int offX, int offY);
-
 // =============================================================================
 // Setup
 // =============================================================================
@@ -324,14 +286,25 @@ void setup() {
 
     Serial.println();
     Serial.println("=================================");
-    Serial.println("  Hinze Robot Companion v0.7");
+    Serial.println("  Hinze Robot Companion v0.8");
     Serial.println("  ESP32-S3 SuperMini");
-    Serial.println("  WiFi Streaming Audio");
+    Serial.println("  RoboEyes + WiFi Streaming");
     Serial.println("=================================");
 
     Wire.begin(I2C_SDA, I2C_SCL);
 
     setupDisplay();
+
+    // Initialize RoboEyes
+    roboEyes.begin(128, 64, 30);
+    roboEyes.setWidth(36, 36);
+    roboEyes.setHeight(36, 36);
+    roboEyes.setBorderradius(8, 8);
+    roboEyes.setSpacebetween(10);
+    roboEyes.setAutoblinker(ON, 3, 3);
+    roboEyes.setIdleMode(ON, 3, 2);
+    roboEyes.setCuriosity(ON);
+
     setupLED();
     setupButton();
     setupI2SMic();
@@ -362,15 +335,10 @@ void loop() {
     handleButton();
     updateAudioCapture();
 
-    if (currentEmotion == EMOTION_IDLE && audioState == AUDIO_IDLE) {
-        updateIdleBehavior();
-    }
-
-    updateEyes();
-    drawEyes();
+    applyEmotion();
+    roboEyes.update();       // Handles clearDisplay + draw + display internally
     updateLED();
 
-    animationFrame++;
     delay(33);  // ~30 FPS
 }
 
@@ -390,7 +358,7 @@ void setupDisplay() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(30, 28);
-    display.print("Hinze v0.7");
+    display.print("Hinze v0.8");
     display.display();
     delay(1000);
 
@@ -558,368 +526,119 @@ void sendEvent(const char* event, const char* action) {
 }
 
 // =============================================================================
-// Idle Behavior (look around + blink)
+// Emotion → RoboEyes Mapping
 // =============================================================================
 
-void updateIdleBehavior() {
-    unsigned long now = millis();
-
-    if (now - lastLookChange > nextLookInterval) {
-        targetPupilX = random(-100, 101) / 100.0;
-        targetPupilY = random(-100, 101) / 100.0;
-        lastLookChange = now;
-        nextLookInterval = random(1500, 4000);
-    }
-
-    if (!isBlinking && now - lastBlink > nextBlinkInterval) {
-        isBlinking = true;
-        blinkFrame = 0;
-        lastBlink = now;
-        nextBlinkInterval = random(2000, 6000);
-    }
-}
-
-void updateEyes() {
-    // Smooth pupil movement
-    float speed = 0.15;
-    pupilX += (targetPupilX - pupilX) * speed;
-    pupilY += (targetPupilY - pupilY) * speed;
-
-    // Blink animation
-    if (isBlinking) {
-        blinkFrame++;
-        if (blinkFrame >= BLINK_FRAMES * 2) {
-            isBlinking = false;
-            blinkFrame = 0;
+void applyEmotion() {
+    // Re-trigger laugh for excited even when emotion hasn't changed
+    if (currentEmotion == EMOTION_EXCITED && currentEmotion == lastAppliedEmotion) {
+        static unsigned long lastLaugh = 0;
+        unsigned long now = millis();
+        if (now - lastLaugh > 2000) {
+            roboEyes.anim_laugh();
+            lastLaugh = now;
         }
+        return;
     }
-}
+    if (currentEmotion == lastAppliedEmotion) return;
+    lastAppliedEmotion = currentEmotion;
 
-// =============================================================================
-// Main Eye Drawing - Routes to emotion-specific functions
-// =============================================================================
-
-void drawEyes() {
-    display.clearDisplay();
+    // Reset to defaults
+    roboEyes.setMood(DEFAULT);
+    roboEyes.setIdleMode(OFF);
+    roboEyes.setAutoblinker(OFF);
+    roboEyes.setHFlicker(OFF);
+    roboEyes.setVFlicker(OFF);
+    roboEyes.eyeLwidthNext = 36;
+    roboEyes.eyeRwidthNext = 36;
+    roboEyes.eyeLheightNext = 36;
+    roboEyes.eyeRheightNext = 36;
+    roboEyes.eyeLborderRadiusNext = 8;
+    roboEyes.eyeRborderRadiusNext = 8;
+    roboEyes.spaceBetweenNext = 10;
+    roboEyes.setPosition(DEFAULT);
 
     switch (currentEmotion) {
-        case EMOTION_IDLE:       drawIdleEyes(); break;
-        case EMOTION_LISTENING:  drawListeningEyes(); break;
-        case EMOTION_THINKING:   drawThinkingEyes(); break;
-        case EMOTION_HAPPY:      drawHappyEyes(); break;
-        case EMOTION_SAD:        drawSadEyes(); break;
-        case EMOTION_ANGRY:      drawAngryEyes(); break;
-        case EMOTION_SURPRISED:  drawSurprisedEyes(); break;
-        case EMOTION_CONFUSED:   drawConfusedEyes(); break;
-        case EMOTION_SLEEPY:     drawSleepyEyes(); break;
-        case EMOTION_EXCITED:    drawExcitedEyes(); break;
+        case EMOTION_IDLE:
+            roboEyes.setAutoblinker(ON, 3, 3);
+            roboEyes.setIdleMode(ON, 3, 2);
+            roboEyes.setCuriosity(ON);
+            break;
+
+        case EMOTION_LISTENING:
+            // Slightly larger eyes, centered gaze
+            roboEyes.eyeLwidthNext = 40;
+            roboEyes.eyeRwidthNext = 40;
+            roboEyes.eyeLheightNext = 40;
+            roboEyes.eyeRheightNext = 40;
+            roboEyes.eyeLborderRadiusNext = 10;
+            roboEyes.eyeRborderRadiusNext = 10;
+            break;
+
+        case EMOTION_THINKING:
+            // Smaller, squinted, looking up-left
+            roboEyes.eyeLwidthNext = 30;
+            roboEyes.eyeRwidthNext = 30;
+            roboEyes.eyeLheightNext = 24;
+            roboEyes.eyeRheightNext = 24;
+            roboEyes.setPosition(NW);
+            break;
+
+        case EMOTION_HAPPY:
+            roboEyes.setMood(HAPPY);
+            roboEyes.setAutoblinker(ON, 4, 2);
+            break;
+
+        case EMOTION_SAD:
+            roboEyes.setMood(TIRED);
+            roboEyes.eyeLheightNext = 28;
+            roboEyes.eyeRheightNext = 28;
+            roboEyes.setPosition(S);
+            break;
+
+        case EMOTION_ANGRY:
+            roboEyes.setMood(ANGRY);
+            roboEyes.eyeLwidthNext = 40;
+            roboEyes.eyeRwidthNext = 40;
+            roboEyes.eyeLheightNext = 24;
+            roboEyes.eyeRheightNext = 24;
+            break;
+
+        case EMOTION_SURPRISED:
+            // Very large round eyes
+            roboEyes.eyeLwidthNext = 44;
+            roboEyes.eyeRwidthNext = 44;
+            roboEyes.eyeLheightNext = 44;
+            roboEyes.eyeRheightNext = 44;
+            roboEyes.eyeLborderRadiusNext = 12;
+            roboEyes.eyeRborderRadiusNext = 12;
+            break;
+
+        case EMOTION_CONFUSED:
+            // Asymmetric eyes
+            roboEyes.eyeLwidthNext = 36;
+            roboEyes.eyeRwidthNext = 30;
+            roboEyes.eyeLheightNext = 36;
+            roboEyes.eyeRheightNext = 28;
+            roboEyes.anim_confused();
+            break;
+
+        case EMOTION_SLEEPY:
+            roboEyes.setMood(TIRED);
+            roboEyes.eyeLheightNext = 16;
+            roboEyes.eyeRheightNext = 16;
+            roboEyes.setAutoblinker(ON, 2, 1);
+            break;
+
+        case EMOTION_EXCITED:
+            roboEyes.setMood(HAPPY);
+            roboEyes.eyeLwidthNext = 40;
+            roboEyes.eyeRwidthNext = 40;
+            roboEyes.eyeLheightNext = 40;
+            roboEyes.eyeRheightNext = 40;
+            roboEyes.anim_laugh();
+            break;
     }
-
-    display.display();
-}
-
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
-void drawRoundEye(int cx, int cy, int w, int h, int pupilOffX, int pupilOffY, int cornerRadius) {
-    int x = cx - w / 2;
-    int y = cy - h / 2;
-    display.fillRoundRect(x, y, w, h, cornerRadius, SSD1306_WHITE);
-
-    // Draw pupil
-    if (h > 8) {
-        int maxOff = (h / 2) - (PUPIL_SIZE / 2) - 2;
-        if (maxOff < 0) maxOff = 0;
-        int py = constrain(cy + pupilOffY, cy - maxOff, cy + maxOff);
-        int px = cx + pupilOffX;
-        display.fillCircle(px, py, PUPIL_SIZE / 2, SSD1306_BLACK);
-    }
-}
-
-// =============================================================================
-// Emotion: IDLE - Look around with natural blink
-// =============================================================================
-
-void drawIdleEyes() {
-    int leftX = 40;
-    int rightX = 88;
-    int eyeY = 32;
-
-    int blinkState = 0;
-    if (isBlinking) {
-        blinkState = (blinkFrame < BLINK_FRAMES) ? blinkFrame : (BLINK_FRAMES * 2 - blinkFrame - 1);
-    }
-
-    int h = EYE_HEIGHT - (blinkState * EYE_HEIGHT / (BLINK_FRAMES + 1));
-    if (h < 4) h = 4;
-
-    int pupilOffX = (int)(pupilX * PUPIL_MAX_OFFSET);
-    int pupilOffY = (int)(pupilY * PUPIL_MAX_OFFSET);
-
-    drawRoundEye(leftX, eyeY, EYE_WIDTH, h, pupilOffX, pupilOffY, 8);
-    drawRoundEye(rightX, eyeY, EYE_WIDTH, h, pupilOffX, pupilOffY, 8);
-}
-
-// =============================================================================
-// Emotion: LISTENING - Wide open, alert eyes
-// =============================================================================
-
-void drawListeningEyes() {
-    int leftX = 40;
-    int rightX = 88;
-    int eyeY = 32;
-
-    // Slightly larger, very round eyes
-    int w = 44;
-    int h = 44;
-
-    // Subtle size pulse
-    int pulse = (animationFrame % 30 < 15) ? 2 : 0;
-    h += pulse;
-    w += pulse;
-
-    drawRoundEye(leftX, eyeY, w, h, 0, -2, 10);
-    drawRoundEye(rightX, eyeY, w, h, 0, -2, 10);
-}
-
-// =============================================================================
-// Emotion: THINKING - Eyes look up-left, slightly squinted
-// =============================================================================
-
-void drawThinkingEyes() {
-    int leftX = 40;
-    int rightX = 88;
-    int eyeY = 32;
-
-    // Squinted eyes
-    int w = 38;
-    int h = 28;
-
-    // Looking up-left
-    int pupilOffX = -6;
-    int pupilOffY = -4;
-
-    drawRoundEye(leftX, eyeY, w, h, pupilOffX, pupilOffY, 6);
-    drawRoundEye(rightX, eyeY, w, h, pupilOffX, pupilOffY, 6);
-
-    // Draw thinking dots
-    int dotY = 50;
-    int numDots = ((animationFrame / 15) % 4);
-    for (int i = 0; i < numDots && i < 3; i++) {
-        display.fillCircle(52 + i * 12, dotY, 3, SSD1306_WHITE);
-    }
-}
-
-// =============================================================================
-// Emotion: HAPPY - Curved ^ ^ anime-style happy eyes
-// =============================================================================
-
-void drawHappyEyes() {
-    int leftX = 40;
-    int rightX = 88;
-    int eyeY = 32;
-
-    // Draw happy curved eyes (like ^ ^)
-    // Left eye - arc curving up
-    for (int i = -18; i <= 18; i++) {
-        int y = eyeY - 8 + abs(i) / 2;
-        display.fillRect(leftX + i - 2, y, 5, 8, SSD1306_WHITE);
-    }
-
-    // Right eye - arc curving up
-    for (int i = -18; i <= 18; i++) {
-        int y = eyeY - 8 + abs(i) / 2;
-        display.fillRect(rightX + i - 2, y, 5, 8, SSD1306_WHITE);
-    }
-}
-
-// =============================================================================
-// Emotion: SAD - Droopy eyes angled down
-// =============================================================================
-
-void drawSadEyes() {
-    int leftX = 40;
-    int rightX = 88;
-    int eyeY = 34;
-
-    // Droopy eyes
-    int w = 36;
-    int h = 30;
-
-    // Draw eyes
-    drawRoundEye(leftX, eyeY, w, h, 0, 4, 6);
-    drawRoundEye(rightX, eyeY, w, h, 0, 4, 6);
-
-    // Sad eyebrows (angled down toward center)
-    // Left eyebrow
-    display.drawLine(leftX - 18, eyeY - 22, leftX + 12, eyeY - 18, SSD1306_WHITE);
-    display.drawLine(leftX - 18, eyeY - 21, leftX + 12, eyeY - 17, SSD1306_WHITE);
-
-    // Right eyebrow
-    display.drawLine(rightX - 12, eyeY - 18, rightX + 18, eyeY - 22, SSD1306_WHITE);
-    display.drawLine(rightX - 12, eyeY - 17, rightX + 18, eyeY - 21, SSD1306_WHITE);
-
-    // Tear drop on left eye
-    if ((animationFrame / 20) % 2 == 0) {
-        int tearY = eyeY + 20 + (animationFrame % 20) / 2;
-        display.fillCircle(leftX + 10, tearY, 3, SSD1306_WHITE);
-    }
-}
-
-// =============================================================================
-// Emotion: ANGRY - Narrow eyes with angled eyebrows
-// =============================================================================
-
-void drawAngryEyes() {
-    int leftX = 40;
-    int rightX = 88;
-    int eyeY = 34;
-
-    // Narrow, intense eyes
-    int w = 42;
-    int h = 20;
-
-    drawRoundEye(leftX, eyeY, w, h, 0, 0, 4);
-    drawRoundEye(rightX, eyeY, w, h, 0, 0, 4);
-
-    // Angry eyebrows (angled down toward center, thick)
-    // Left eyebrow - angled down to right
-    for (int t = 0; t < 4; t++) {
-        display.drawLine(leftX - 20, eyeY - 16 + t, leftX + 15, eyeY - 24 + t, SSD1306_WHITE);
-    }
-
-    // Right eyebrow - angled down to left
-    for (int t = 0; t < 4; t++) {
-        display.drawLine(rightX - 15, eyeY - 24 + t, rightX + 20, eyeY - 16 + t, SSD1306_WHITE);
-    }
-}
-
-// =============================================================================
-// Emotion: SURPRISED - Very wide, round eyes
-// =============================================================================
-
-void drawSurprisedEyes() {
-    int leftX = 40;
-    int rightX = 88;
-    int eyeY = 34;
-
-    // Very large round eyes
-    int w = 46;
-    int h = 46;
-
-    // Small pupils for surprised look
-    display.fillRoundRect(leftX - w/2, eyeY - h/2, w, h, 12, SSD1306_WHITE);
-    display.fillRoundRect(rightX - w/2, eyeY - h/2, w, h, 12, SSD1306_WHITE);
-
-    // Small pupils
-    display.fillCircle(leftX, eyeY - 2, 4, SSD1306_BLACK);
-    display.fillCircle(rightX, eyeY - 2, 4, SSD1306_BLACK);
-
-    // Raised eyebrows
-    display.fillRoundRect(leftX - 18, eyeY - 32, 36, 4, 2, SSD1306_WHITE);
-    display.fillRoundRect(rightX - 18, eyeY - 32, 36, 4, 2, SSD1306_WHITE);
-}
-
-// =============================================================================
-// Emotion: CONFUSED - Asymmetric eyes, one raised
-// =============================================================================
-
-void drawConfusedEyes() {
-    int leftX = 40;
-    int rightX = 88;
-
-    // Left eye - normal but looking to side
-    drawRoundEye(leftX, 34, 38, 36, 6, 0, 8);
-
-    // Right eye - raised and smaller (questioning)
-    drawRoundEye(rightX, 28, 34, 32, -4, -2, 8);
-
-    // One raised eyebrow on right
-    display.fillRoundRect(rightX - 16, 8, 32, 4, 2, SSD1306_WHITE);
-
-    // Question mark
-    display.setTextSize(2);
-    display.setCursor(108, 8);
-    display.print("?");
-}
-
-// =============================================================================
-// Emotion: SLEEPY - Half-closed eyes
-// =============================================================================
-
-void drawSleepyEyes() {
-    int leftX = 40;
-    int rightX = 88;
-    int eyeY = 34;
-
-    // Half-closed droopy eyes
-    int w = 40;
-    int h = 14;  // Very squished
-
-    // Slight droop animation
-    int droop = (animationFrame / 40) % 2 == 0 ? 0 : 2;
-    h -= droop;
-    if (h < 8) h = 8;
-
-    drawRoundEye(leftX, eyeY + 2, w, h, 0, 0, 4);
-    drawRoundEye(rightX, eyeY + 2, w, h, 0, 0, 4);
-
-    // Heavy eyelids (top of eye darker/covered)
-    display.fillRect(leftX - 22, eyeY - 12, 44, 12, SSD1306_BLACK);
-    display.fillRect(rightX - 22, eyeY - 12, 44, 12, SSD1306_BLACK);
-
-    // Z's floating
-    display.setTextSize(1);
-    int zOffset = (animationFrame / 10) % 10;
-    display.setCursor(100, 10 - zOffset/2);
-    display.print("Z");
-    display.setCursor(108, 5 - zOffset/2);
-    display.print("z");
-    display.setCursor(114, 0);
-    display.print("z");
-}
-
-// =============================================================================
-// Emotion: EXCITED - Sparkly bouncy eyes
-// =============================================================================
-
-void drawExcitedEyes() {
-    int leftX = 40;
-    int rightX = 88;
-
-    // Bouncy vertical offset
-    int bounce = sin(animationFrame * 0.3) * 4;
-    int eyeY = 32 + bounce;
-
-    // Bright wide eyes
-    int w = 42;
-    int h = 42;
-
-    drawRoundEye(leftX, eyeY, w, h, 0, -2, 10);
-    drawRoundEye(rightX, eyeY, w, h, 0, -2, 10);
-
-    // Sparkle effects around eyes
-    int sparklePhase = (animationFrame / 5) % 4;
-
-    // Sparkles at different positions based on phase
-    if (sparklePhase == 0) {
-        display.drawPixel(leftX - 24, eyeY - 20, SSD1306_WHITE);
-        display.drawPixel(rightX + 24, eyeY - 18, SSD1306_WHITE);
-    } else if (sparklePhase == 1) {
-        display.drawLine(leftX + 20, eyeY - 24, leftX + 24, eyeY - 28, SSD1306_WHITE);
-        display.drawLine(rightX - 20, eyeY - 24, rightX - 24, eyeY - 28, SSD1306_WHITE);
-    } else if (sparklePhase == 2) {
-        display.fillCircle(leftX - 26, eyeY, 2, SSD1306_WHITE);
-        display.fillCircle(rightX + 26, eyeY, 2, SSD1306_WHITE);
-    } else {
-        display.drawLine(leftX - 22, eyeY + 18, leftX - 18, eyeY + 22, SSD1306_WHITE);
-        display.drawLine(rightX + 22, eyeY + 18, rightX + 18, eyeY + 22, SSD1306_WHITE);
-    }
-
-    // Star sparkle in eyes
-    display.drawPixel(leftX + 6, eyeY - 8, SSD1306_WHITE);
-    display.drawPixel(rightX + 6, eyeY - 8, SSD1306_WHITE);
 }
 
 // =============================================================================
@@ -993,10 +712,7 @@ void handleButton() {
             sendEvent("button", "press");
             startRecording();
 
-            // Reset animation states
-            targetPupilX = 0;
-            targetPupilY = 0;
-            animationFrame = 0;
+            lastAppliedEmotion = (Emotion)-1;
         } else if (audioState == AUDIO_STREAMING) {
             // Only allow manual stop after minimum recording time (prevent bounce)
             if (millis() - recordingStartTime > 500) {
@@ -1579,10 +1295,7 @@ void setEmotionByName(const char* name) {
     else if (strcmp(name, "sleepy") == 0) currentEmotion = EMOTION_SLEEPY;
     else if (strcmp(name, "excited") == 0) currentEmotion = EMOTION_EXCITED;
 
-    // Reset animation states
-    targetPupilX = 0;
-    targetPupilY = 0;
-    animationFrame = 0;
+    lastAppliedEmotion = (Emotion)-1;  // Force reapply
 }
 
 void sendStatus(Transport source) {
@@ -1596,7 +1309,7 @@ void sendStatus(Transport source) {
 
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "{\"status\":\"ok\",\"version\":\"0.7\",\"emotion\":\"%s\",\"audio\":\"%s\",\"wifi\":\"%s\",\"ring_buf\":%d}",
+        "{\"status\":\"ok\",\"version\":\"0.8\",\"emotion\":\"%s\",\"audio\":\"%s\",\"wifi\":\"%s\",\"ring_buf\":%d}",
         emotionNames[currentEmotion],
         audioStateNames[audioState],
         wifiConnected ? "connected" : "disconnected",
