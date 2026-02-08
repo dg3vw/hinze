@@ -10,6 +10,12 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 
+// Forward declarations
+void playbackTask(void* param);
+void setupI2SMic();
+void setupI2SSpk();
+static TaskHandle_t playbackTaskHandle = NULL;
+
 // =============================================================================
 // Pin Definitions - ESP32-S3 SuperMini
 // =============================================================================
@@ -52,12 +58,12 @@
 // Ring Buffer for Streaming Playback
 // =============================================================================
 
-#define RING_BUFFER_SIZE    8000    // 1 second at 8kHz (16 KB)
+#define RING_BUFFER_SIZE    16000   // 2 seconds at 8kHz (32 KB)
 #define PREFILL_SAMPLES     4000    // 0.5 sec prefill before playback starts
 #define REBUFFER_SAMPLES    2000    // 0.25 sec rebuffer after underrun
-#define PLAYBACK_CHUNK_SIZE 256     // Samples per loop iteration (~32ms at 8kHz)
+#define PLAYBACK_CHUNK_SIZE 128     // Samples per loop iteration (~16ms at 8kHz)
 
-static int16_t ringBuffer[RING_BUFFER_SIZE];
+static int16_t ringBuffer[RING_BUFFER_SIZE];  // 32 KB
 static volatile size_t ringWritePos = 0;
 static volatile size_t ringReadPos = 0;
 static volatile bool ringStreamEnded = false;  // Host sent play_stop
@@ -75,13 +81,22 @@ static inline size_t ringFree() {
 }
 
 static void ringWrite(const int16_t* data, size_t samples) {
-    size_t free = ringFree();
-    if (samples > free) {
-        samples = free;  // Drop overflow
-    }
-    for (size_t i = 0; i < samples; i++) {
-        ringBuffer[ringWritePos] = data[i];
-        ringWritePos = (ringWritePos + 1) % RING_BUFFER_SIZE;
+    // Blocking write: wait for space instead of dropping samples.
+    // This back-pressures TCP naturally (stops reading → TCP flow control).
+    size_t written = 0;
+    unsigned long start = millis();
+    while (written < samples && millis() - start < 3000) {
+        size_t free = ringFree();
+        if (free == 0) {
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+            continue;
+        }
+        size_t toWrite = min(samples - written, free);
+        for (size_t i = 0; i < toWrite; i++) {
+            ringBuffer[ringWritePos] = data[written + i];
+            ringWritePos = (ringWritePos + 1) % RING_BUFFER_SIZE;
+        }
+        written += toWrite;
     }
 }
 
@@ -144,6 +159,7 @@ WiFiServer tcpServer(WIFI_TCP_PORT);
 WiFiClient tcpClient;
 bool wifiConnected = false;
 bool tcpClientConnected = false;
+static SemaphoreHandle_t tcpWriteMutex = NULL;
 
 // Transport: which channel is active for the current session
 enum Transport {
@@ -321,6 +337,18 @@ void setup() {
     setupI2SMic();
     setupWiFi();
 
+    // Start playback task on Core 1 (priority 2, above loop's priority 1)
+    xTaskCreatePinnedToCore(
+        playbackTask,
+        "playback",
+        4096,
+        NULL,
+        2,          // Higher priority than loop (1)
+        &playbackTaskHandle,
+        1           // Core 1 (same as loop)
+    );
+    Serial.println("[INIT] Playback task started on core 1");
+
     Serial.println("[INIT] Setup complete!");
     sendEvent("ready");
 }
@@ -333,7 +361,6 @@ void loop() {
     handleSerialInput();
     handleButton();
     updateAudioCapture();
-    updateStreamingPlayback();
 
     if (currentEmotion == EMOTION_IDLE && audioState == AUDIO_IDLE) {
         updateIdleBehavior();
@@ -411,6 +438,9 @@ void setupWiFi() {
         tcpServer.begin();
         tcpServer.setNoDelay(true);
         Serial.printf("[WIFI] TCP server listening on port %d\n", WIFI_TCP_PORT);
+
+        // Create mutex for thread-safe TCP writes
+        tcpWriteMutex = xSemaphoreCreateMutex();
 
         // Launch network task on core 0
         xTaskCreatePinnedToCore(
@@ -501,7 +531,10 @@ void wifiNetTask(void* param) {
 
 void sendResponse(const char* json, Transport source) {
     if (source == TRANSPORT_TCP && tcpClientConnected) {
-        tcpClient.println(json);
+        if (xSemaphoreTake(tcpWriteMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            tcpClient.println(json);
+            xSemaphoreGive(tcpWriteMutex);
+        }
     } else {
         Serial.println(json);
     }
@@ -516,8 +549,11 @@ void sendEvent(const char* event, const char* action) {
     }
     // Send events on both transports so host always sees them
     Serial.println(buf);
-    if (tcpClientConnected) {
-        tcpClient.println(buf);
+    if (tcpClientConnected && tcpWriteMutex) {
+        if (xSemaphoreTake(tcpWriteMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            tcpClient.println(buf);
+            xSemaphoreGive(tcpWriteMutex);
+        }
     }
 }
 
@@ -1060,10 +1096,86 @@ void setupI2SSpk() {
 }
 
 // =============================================================================
-// Streaming Playback - Non-blocking, ring buffer based
+// Streaming Playback - Dedicated FreeRTOS task with blocking I2S writes
 // =============================================================================
 
 static int audioPacketCount = 0;
+
+void playbackTask(void* param) {
+    int16_t playChunk[PLAYBACK_CHUNK_SIZE];
+    int32_t stereoBuffer[PLAYBACK_CHUNK_SIZE * 2];
+
+    while (true) {
+        if (audioState == AUDIO_PLAYING) {
+            size_t avail = ringAvailable();
+
+            if (avail == 0) {
+                if (ringStreamEnded) {
+                    // Wait for I2S DMA to finish playing remaining buffered audio
+                    vTaskDelay(500 / portTICK_PERIOD_MS);
+                    Serial.println("[AUDIO] Ring buffer drained, playback done");
+                    Serial.printf("[AUDIO] Playback complete. %d packets received.\n", audioPacketCount);
+                    audioState = AUDIO_IDLE;
+                    i2s_driver_uninstall(I2S_PORT_SPK);
+                    setupI2SMic();
+                    continue;
+                }
+                // Underrun - rebuffer
+                Serial.println("[AUDIO] Buffer underrun, rebuffering...");
+                audioState = AUDIO_REBUFFERING;
+                continue;
+            }
+
+            size_t toPlay = min(avail, (size_t)PLAYBACK_CHUNK_SIZE);
+            size_t got = ringRead(playChunk, toPlay);
+
+            // Convert to 32-bit stereo for I2S
+            for (size_t i = 0; i < got; i++) {
+                int32_t sample = (int32_t)playChunk[i] * 2;
+                if (sample > 32767) sample = 32767;
+                if (sample < -32768) sample = -32768;
+                sample <<= 16;
+                stereoBuffer[i * 2] = sample;
+                stereoBuffer[i * 2 + 1] = sample;
+            }
+
+            // Blocking I2S write - paces naturally at 8kHz
+            // FreeRTOS yields to loop() during the block
+            size_t bytesWritten;
+            i2s_write(I2S_PORT_SPK, stereoBuffer, got * 8, &bytesWritten, portMAX_DELAY);
+
+        } else if (audioState == AUDIO_BUFFERING) {
+            size_t avail = ringAvailable();
+            if (avail >= PREFILL_SAMPLES || (ringStreamEnded && avail > 0)) {
+                Serial.printf("[AUDIO] Prefill complete (%d samples), starting playback\n", avail);
+                audioState = AUDIO_PLAYING;
+            } else if (ringStreamEnded && avail == 0) {
+                Serial.println("[AUDIO] Stream ended with no audio");
+                audioState = AUDIO_IDLE;
+                i2s_driver_uninstall(I2S_PORT_SPK);
+                setupI2SMic();
+            }
+            vTaskDelay(5 / portTICK_PERIOD_MS);
+
+        } else if (audioState == AUDIO_REBUFFERING) {
+            size_t avail = ringAvailable();
+            if (avail >= REBUFFER_SAMPLES || (ringStreamEnded && avail > 0)) {
+                Serial.printf("[AUDIO] Rebuffer complete (%d samples), resuming\n", avail);
+                audioState = AUDIO_PLAYING;
+            } else if (ringStreamEnded && avail == 0) {
+                Serial.println("[AUDIO] Stream ended during rebuffer");
+                audioState = AUDIO_IDLE;
+                i2s_driver_uninstall(I2S_PORT_SPK);
+                setupI2SMic();
+            }
+            vTaskDelay(5 / portTICK_PERIOD_MS);
+
+        } else {
+            // IDLE - sleep longer, check periodically
+            vTaskDelay(20 / portTICK_PERIOD_MS);
+        }
+    }
+}
 
 void startPlaybackMode(Transport source) {
     // Switch from mic to speaker I2S
@@ -1073,87 +1185,11 @@ void startPlaybackMode(Transport source) {
     ringReset();
     audioPacketCount = 0;
     activeTransport = source;
-    audioState = AUDIO_BUFFERING;
+    audioState = AUDIO_BUFFERING;  // Playback task picks this up
 
     char resp[] = "{\"ok\":true,\"action\":\"play_ready\"}";
     sendResponse(resp, source);
     Serial.println("[AUDIO] Playback mode: buffering...");
-}
-
-void stopPlaybackMode() {
-    Serial.printf("[AUDIO] Playback complete. %d packets received.\n", audioPacketCount);
-    audioState = AUDIO_IDLE;
-    i2s_driver_uninstall(I2S_PORT_SPK);
-    setupI2SMic();
-}
-
-void updateStreamingPlayback() {
-    // Only run in playback-related states
-    if (audioState != AUDIO_BUFFERING && audioState != AUDIO_PLAYING && audioState != AUDIO_REBUFFERING) {
-        return;
-    }
-
-    size_t avail = ringAvailable();
-
-    // BUFFERING: wait for prefill before starting playback
-    if (audioState == AUDIO_BUFFERING) {
-        if (avail >= PREFILL_SAMPLES || (ringStreamEnded && avail > 0)) {
-            Serial.printf("[AUDIO] Prefill complete (%d samples), starting playback\n", avail);
-            audioState = AUDIO_PLAYING;
-        } else if (ringStreamEnded && avail == 0) {
-            // Stream ended before we got any audio
-            Serial.println("[AUDIO] Stream ended with no audio");
-            stopPlaybackMode();
-            return;
-        }
-        return;  // Don't play yet
-    }
-
-    // REBUFFERING: wait for partial refill after underrun
-    if (audioState == AUDIO_REBUFFERING) {
-        if (avail >= REBUFFER_SAMPLES || (ringStreamEnded && avail > 0)) {
-            Serial.printf("[AUDIO] Rebuffer complete (%d samples), resuming\n", avail);
-            audioState = AUDIO_PLAYING;
-        } else if (ringStreamEnded && avail == 0) {
-            Serial.println("[AUDIO] Stream ended during rebuffer");
-            stopPlaybackMode();
-            return;
-        }
-        return;
-    }
-
-    // PLAYING: feed I2S from ring buffer
-    if (avail == 0) {
-        if (ringStreamEnded) {
-            // All audio played
-            Serial.println("[AUDIO] Ring buffer drained, playback done");
-            stopPlaybackMode();
-            return;
-        }
-        // Underrun - need to rebuffer
-        Serial.println("[AUDIO] Buffer underrun, rebuffering...");
-        audioState = AUDIO_REBUFFERING;
-        return;
-    }
-
-    // Read up to PLAYBACK_CHUNK_SIZE samples from ring buffer
-    int16_t playChunk[PLAYBACK_CHUNK_SIZE];
-    size_t toPlay = min(avail, (size_t)PLAYBACK_CHUNK_SIZE);
-    size_t got = ringRead(playChunk, toPlay);
-
-    // Convert to 32-bit stereo for I2S
-    int32_t stereoBuffer[PLAYBACK_CHUNK_SIZE * 2];
-    for (size_t i = 0; i < got; i++) {
-        int32_t sample = (int32_t)playChunk[i] * 2;
-        if (sample > 32767) sample = 32767;
-        if (sample < -32768) sample = -32768;
-        sample <<= 16;
-        stereoBuffer[i * 2] = sample;
-        stereoBuffer[i * 2 + 1] = sample;
-    }
-
-    size_t bytesWritten;
-    i2s_write(I2S_PORT_SPK, stereoBuffer, got * 8, &bytesWritten, 10 / portTICK_PERIOD_MS);
 }
 
 // =============================================================================
@@ -1267,16 +1303,19 @@ void streamAudioPacket(int16_t* data, size_t samples) {
     Serial.write((uint8_t)(dataBytes & 0xFF));
     Serial.write((uint8_t*)data, dataBytes);
 
-    // Also send via TCP if client connected
-    if (tcpClientConnected) {
-        uint8_t header[4] = {
-            AUDIO_HEADER_1,
-            AUDIO_HEADER_2,
-            (uint8_t)(dataBytes >> 8),
-            (uint8_t)(dataBytes & 0xFF)
-        };
-        tcpClient.write(header, 4);
-        tcpClient.write((uint8_t*)data, dataBytes);
+    // Also send via TCP if client connected (mutex-protected)
+    if (tcpClientConnected && tcpWriteMutex) {
+        if (xSemaphoreTake(tcpWriteMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            uint8_t header[4] = {
+                AUDIO_HEADER_1,
+                AUDIO_HEADER_2,
+                (uint8_t)(dataBytes >> 8),
+                (uint8_t)(dataBytes & 0xFF)
+            };
+            tcpClient.write(header, 4);
+            tcpClient.write((uint8_t*)data, dataBytes);
+            xSemaphoreGive(tcpWriteMutex);
+        }
     }
 }
 

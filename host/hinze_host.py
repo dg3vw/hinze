@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import select
 import socket
 import struct
 import sys
@@ -332,16 +333,19 @@ class TCPHandler(ConnectionHandler):
         self.host = host or getattr(sys.modules[__name__], 'ESP32_HOST', 'hinze.local')
         self.port = port or getattr(sys.modules[__name__], 'ESP32_PORT', 8266)
         self.sock = None
-        self.sock_file = None
         self._lock = threading.Lock()
+        # Manual read buffer: recv large chunks, serve bytes from buffer
+        self._recv_buf = b''
 
     def connect(self) -> bool:
         try:
             print(f"[TCP] Connecting to {self.host}:{self.port}...")
             self.sock = socket.create_connection((self.host, self.port), timeout=5.0)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.sock.settimeout(0.1)
-            self.sock_file = self.sock.makefile('rb')
+            # Fully blocking for writes (TCP flow control back-pressure)
+            # Use select() in _fill_buffer() for read timeouts
+            self.sock.settimeout(None)
+            self._recv_buf = b''
             print(f"[TCP] Connected to {self.host}:{self.port}")
             return True
         except (socket.error, OSError) as e:
@@ -352,57 +356,89 @@ class TCPHandler(ConnectionHandler):
         self.running = False
         if self.read_thread:
             self.read_thread.join(timeout=1.0)
-        if self.sock_file:
-            try:
-                self.sock_file.close()
-            except:
-                pass
-            self.sock_file = None
         if self.sock:
             try:
                 self.sock.close()
             except:
                 pass
             self.sock = None
+        self._recv_buf = b''
         print("[TCP] Disconnected")
+
+    def _fill_buffer(self):
+        """Read a chunk from socket using select() for timeout."""
+        try:
+            ready, _, _ = select.select([self.sock], [], [], 0.1)
+            if ready:
+                data = self.sock.recv(4096)
+                if data:
+                    self._recv_buf += data
+        except (socket.error, OSError):
+            pass
 
     def _write_bytes(self, data: bytes):
         with self._lock:
             if self.sock:
                 try:
                     self.sock.sendall(data)
+                except socket.timeout:
+                    # Should not happen with settimeout(None), but retry once
+                    print(f"[TCP] Write timeout, retrying...")
+                    try:
+                        self.sock.sendall(data)
+                    except (socket.error, OSError) as e:
+                        print(f"[TCP] Write retry failed: {e}")
                 except (socket.error, OSError) as e:
                     print(f"[TCP] Write error: {e}")
 
     def _read_byte(self) -> bytes:
-        try:
-            if self.sock:
-                data = self.sock.recv(1)
-                return data if data else b''
-        except socket.timeout:
+        if not self.sock:
             return b''
-        except (socket.error, OSError):
-            return b''
+        if not self._recv_buf:
+            self._fill_buffer()
+        if self._recv_buf:
+            byte = self._recv_buf[:1]
+            self._recv_buf = self._recv_buf[1:]
+            return byte
         return b''
 
     def _read_bytes(self, count: int) -> bytes:
         if not self.sock:
             return b''
-        data = b''
-        while len(data) < count:
-            try:
-                chunk = self.sock.recv(count - len(data))
-                if not chunk:
-                    break
-                data += chunk
-            except socket.timeout:
-                continue
-            except (socket.error, OSError):
+        # Wait until we have enough data (with timeout retries)
+        attempts = 0
+        while len(self._recv_buf) < count and attempts < 50:
+            self._fill_buffer()
+            if len(self._recv_buf) >= count:
                 break
+            attempts += 1
+        # Return what we have (up to count)
+        data = self._recv_buf[:count]
+        self._recv_buf = self._recv_buf[count:]
         return data
 
     def _available(self) -> bool:
         return self.sock is not None
+
+    def send_audio(self, audio: np.ndarray, chunk_size: int = 1024):
+        """Send audio data over TCP. No pacing needed - ESP32 ring buffer
+        blocking write provides natural TCP back-pressure."""
+        if audio.dtype != np.int16:
+            audio = (audio * 32767).astype(np.int16)
+
+        for i in range(0, len(audio), chunk_size):
+            chunk = audio[i:i + chunk_size]
+            data = chunk.tobytes()
+            data_len = len(data)
+
+            packet = bytes([
+                self.HEADER_1,
+                self.HEADER_2,
+                (data_len >> 8) & 0xFF,
+                data_len & 0xFF
+            ]) + data
+
+            self._write_bytes(packet)
 
 
 class SpeechRecognizer:
@@ -825,6 +861,8 @@ class HinzeHost:
                 self.conn.send_audio(chunk)
                 total_samples += len(chunk)
 
+            # Let last TCP packets arrive before signaling end
+            time.sleep(0.3)
             # Signal end of stream - ESP32 will play until ring buffer drains
             self.conn.stop_playback()
             print(f"[HOST] Streamed {total_samples/8000:.1f}s of audio")
