@@ -269,8 +269,14 @@ class SerialHandler(ConnectionHandler):
 
     def connect(self) -> bool:
         try:
-            self.serial = serial.Serial(self.port, self.baud, timeout=0.1)
-            time.sleep(2)  # Wait for ESP32 reset
+            self.serial = serial.Serial()
+            self.serial.port = self.port
+            self.serial.baudrate = self.baud
+            self.serial.timeout = 0.1
+            self.serial.dtr = False
+            self.serial.rts = False
+            self.serial.open()
+            time.sleep(0.5)  # Let UART settle
             self.serial.reset_input_buffer()
             print(f"[SERIAL] Connected to {self.port}")
             return True
@@ -405,14 +411,22 @@ class TCPHandler(ConnectionHandler):
     def _read_bytes(self, count: int) -> bytes:
         if not self.sock:
             return b''
-        # Wait until we have enough data (with timeout retries)
-        attempts = 0
-        while len(self._recv_buf) < count and attempts < 50:
-            self._fill_buffer()
-            if len(self._recv_buf) >= count:
+        # Block until we have all requested bytes (up to 5s timeout)
+        deadline = time.time() + 5.0
+        while len(self._recv_buf) < count:
+            remaining = deadline - time.time()
+            if remaining <= 0:
                 break
-            attempts += 1
-        # Return what we have (up to count)
+            try:
+                ready, _, _ = select.select([self.sock], [], [], min(remaining, 0.1))
+                if ready:
+                    data = self.sock.recv(max(4096, count - len(self._recv_buf)))
+                    if data:
+                        self._recv_buf += data
+                    else:
+                        break  # Connection closed
+            except (socket.error, OSError):
+                break
         data = self._recv_buf[:count]
         self._recv_buf = self._recv_buf[count:]
         return data
@@ -421,8 +435,7 @@ class TCPHandler(ConnectionHandler):
         return self.sock is not None
 
     def send_audio(self, audio: np.ndarray, chunk_size: int = 1024):
-        """Send audio data over TCP. No pacing needed - ESP32 ring buffer
-        blocking write provides natural TCP back-pressure."""
+        """Send audio data over TCP with pacing to avoid overwhelming ESP32."""
         if audio.dtype != np.int16:
             audio = (audio * 32767).astype(np.int16)
 
@@ -439,6 +452,7 @@ class TCPHandler(ConnectionHandler):
             ]) + data
 
             self._write_bytes(packet)
+            time.sleep(0.01)  # Pace to avoid flooding ESP32
 
 
 class SpeechRecognizer:
@@ -861,14 +875,17 @@ class HinzeHost:
                 self.conn.send_audio(chunk)
                 total_samples += len(chunk)
 
-            # Let last TCP packets arrive before signaling end
-            time.sleep(0.3)
+            # Wait for buffers to flush before signaling end.
+            # With pacing (0.01s per chunk), data is already mostly delivered.
+            wait_time = 0.5
+            time.sleep(wait_time)
             # Signal end of stream - ESP32 will play until ring buffer drains
             self.conn.stop_playback()
             print(f"[HOST] Streamed {total_samples/8000:.1f}s of audio")
 
-        # 5. Return to idle
-        time.sleep(1)
+        # 5. Wait for ESP32 to finish playing, then return to idle
+        # Ring buffer holds up to 2s of audio at 8kHz
+        time.sleep(3)
         self.conn.set_emotion("idle")
         print("[HOST] === Interaction Complete ===\n")
 

@@ -18,33 +18,34 @@ void setupI2SSpk();
 static TaskHandle_t playbackTaskHandle = NULL;
 
 // =============================================================================
-// Pin Definitions - ESP32-S3 SuperMini
+// Pin Definitions - ESP32-S3 SPK Board
 // =============================================================================
 
-// I2S Audio
-#define I2S_WS          5
-#define I2S_BCK         6
-#define I2S_DIN         4
-#define I2S_DOUT        7
+// I2S Microphone (MSM261D3526H1CPM, dual onboard)
+#define I2S_MIC_BCK     39
+#define I2S_MIC_WS      40
+#define I2S_MIC_DIN     38
+
+// I2S Speaker (NS4168, onboard)
+#define I2S_SPK_BCK     10
+#define I2S_SPK_WS      45
+#define I2S_SPK_DOUT    9
+#define I2S_SPK_CTRL    46  // Amp enable pin (HIGH = on)
 
 // I2C Display
-#define I2C_SDA         8
-#define I2C_SCL         9
-
-// Servos (for future use)
-#define SERVO_PAN       1
-#define SERVO_TILT      2
+#define I2C_SDA         13
+#define I2C_SCL         14
 
 // LED & Touch Sensor
-#define WS2812_DATA     48
-#define TOUCH_PIN       10  // TTP223 touch sensor (active HIGH)
+#define SK6812_DATA     21
+#define TOUCH_PIN       1   // TTP223 touch sensor (active HIGH)
 
 // =============================================================================
 // I2S Audio Configuration
 // =============================================================================
 
 #define I2S_PORT_MIC    I2S_NUM_0
-#define I2S_PORT_SPK    I2S_NUM_0  // Use same port as mic (switch RX/TX)
+#define I2S_PORT_SPK    I2S_NUM_1  // Separate peripheral, no switching needed
 #define SAMPLE_RATE     16000
 #define SAMPLE_RATE_TTS 8000   // Low rate for speech
 #define SAMPLE_BITS     16
@@ -64,7 +65,7 @@ static TaskHandle_t playbackTaskHandle = NULL;
 #define REBUFFER_SAMPLES    2000    // 0.25 sec rebuffer after underrun
 #define PLAYBACK_CHUNK_SIZE 128     // Samples per loop iteration (~16ms at 8kHz)
 
-static int16_t ringBuffer[RING_BUFFER_SIZE];  // 32 KB
+static int16_t* ringBuffer = NULL;  // Allocated in PSRAM at boot
 static volatile size_t ringWritePos = 0;
 static volatile size_t ringReadPos = 0;
 static volatile bool ringStreamEnded = false;  // Host sent play_stop
@@ -130,7 +131,7 @@ enum AudioState {
     AUDIO_REBUFFERING    // Underrun recovery, waiting for rebuffer fill
 };
 
-AudioState audioState = AUDIO_IDLE;
+volatile AudioState audioState = AUDIO_IDLE;
 int32_t rawAudioBuffer[AUDIO_BUFFER_SIZE];  // 32-bit buffer for INMP441
 int16_t audioBuffer[AUDIO_BUFFER_SIZE];     // 16-bit buffer for I/O
 unsigned long recordingStartTime = 0;
@@ -153,7 +154,7 @@ bool speechDetected = false;
 
 #define WIFI_TCP_PORT       8266
 #define WIFI_CONNECT_TIMEOUT_MS 10000
-#define WIFI_NET_TASK_STACK 8192
+#define WIFI_NET_TASK_STACK 16384
 
 Preferences preferences;
 WiFiServer tcpServer(WIFI_TCP_PORT);
@@ -254,6 +255,8 @@ void setupLED();
 void setupButton();
 void setupI2SMic();
 void setupI2SSpk();
+void setupAmpCtrl();
+void setAmpEnabled(bool on);
 void setupWiFi();
 void applyEmotion();
 void updateLED();
@@ -282,14 +285,32 @@ void wifiNetTask(void* param);
 void setup() {
     Serial.setRxBufferSize(16384);  // Large buffer for audio streaming
     Serial.begin(921600);  // High speed for audio streaming
-    while (!Serial && millis() < 3000);
+    delay(500);  // Let UART settle
 
     Serial.println();
     Serial.println("=================================");
-    Serial.println("  Hinze Robot Companion v0.8");
-    Serial.println("  ESP32-S3 SuperMini");
-    Serial.println("  RoboEyes + WiFi Streaming");
+    Serial.println("  Hinze Robot Companion v0.9");
+    Serial.println("  ESP32-S3 SPK Board");
+    Serial.println("  Dual I2S + WiFi Streaming");
     Serial.println("=================================");
+
+    // Allocate ring buffer — try PSRAM first, fall back to heap
+    if (psramFound()) {
+        Serial.printf("[INIT] PSRAM found: %d bytes\n", ESP.getPsramSize());
+        ringBuffer = (int16_t*)ps_malloc(RING_BUFFER_SIZE * sizeof(int16_t));
+    }
+    if (!ringBuffer) {
+        Serial.println("[INIT] PSRAM alloc failed, using heap");
+        ringBuffer = (int16_t*)malloc(RING_BUFFER_SIZE * sizeof(int16_t));
+    }
+    if (ringBuffer) {
+        memset(ringBuffer, 0, RING_BUFFER_SIZE * sizeof(int16_t));
+        Serial.printf("[INIT] Ring buffer: %d samples (%d KB)\n",
+                      RING_BUFFER_SIZE, RING_BUFFER_SIZE * 2 / 1024);
+    } else {
+        Serial.println("[INIT] ERROR: Ring buffer allocation failed!");
+    }
+    Serial.printf("[INIT] Free heap: %d\n", ESP.getFreeHeap());
 
     Wire.begin(I2C_SDA, I2C_SCL);
 
@@ -308,13 +329,15 @@ void setup() {
     setupLED();
     setupButton();
     setupI2SMic();
+    setupI2SSpk();
+    setupAmpCtrl();
     setupWiFi();
 
     // Start playback task on Core 1 (priority 2, above loop's priority 1)
     xTaskCreatePinnedToCore(
         playbackTask,
         "playback",
-        4096,
+        8192,
         NULL,
         2,          // Higher priority than loop (1)
         &playbackTaskHandle,
@@ -358,7 +381,7 @@ void setupDisplay() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(30, 28);
-    display.print("Hinze v0.8");
+    display.print("Hinze v0.9");
     display.display();
     delay(1000);
 
@@ -647,11 +670,11 @@ void applyEmotion() {
 
 void setupLED() {
     Serial.println("[INIT] Setting up LED...");
-    FastLED.addLeds<WS2812, WS2812_DATA, GRB>(leds, NUM_LEDS);
+    FastLED.addLeds<SK6812, SK6812_DATA, GRB>(leds, NUM_LEDS);
     FastLED.setBrightness(LED_BRIGHTNESS);
     leds[0] = CRGB::Black;
     FastLED.show();
-    Serial.printf("[LED] WS2812 on GPIO %d\n", WS2812_DATA);
+    Serial.printf("[LED] SK6812 on GPIO %d\n", SK6812_DATA);
 }
 
 void updateLED() {
@@ -728,13 +751,13 @@ void handleButton() {
 // =============================================================================
 
 void setupI2SMic() {
-    Serial.println("[INIT] Setting up I2S microphone...");
+    Serial.println("[INIT] Setting up PDM microphone...");
 
     i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
         .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,  // INMP441 outputs 24-bit in 32-bit frame
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // L/R pin to GND = LEFT channel
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // PDM decimation outputs 16-bit PCM
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // One mic channel
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 4,
@@ -744,27 +767,29 @@ void setupI2SMic() {
         .fixed_mclk = 0
     };
 
+    // PDM: ws_io_num = PDM clock output, data_in_num = PDM data input
+    // bck not used for PDM
     i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_BCK,
-        .ws_io_num = I2S_WS,
+        .bck_io_num = I2S_PIN_NO_CHANGE,
+        .ws_io_num = I2S_MIC_BCK,   // GPIO 39 = PDM CLK
         .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_DIN
+        .data_in_num = I2S_MIC_DIN  // GPIO 38 = PDM DATA
     };
 
     esp_err_t err = i2s_driver_install(I2S_PORT_MIC, &i2s_config, 0, NULL);
     if (err != ESP_OK) {
-        Serial.printf("[I2S] ERROR: Driver install failed: %d\n", err);
+        Serial.printf("[I2S] ERROR: PDM mic driver install failed: %d\n", err);
         return;
     }
 
     err = i2s_set_pin(I2S_PORT_MIC, &pin_config);
     if (err != ESP_OK) {
-        Serial.printf("[I2S] ERROR: Pin config failed: %d\n", err);
+        Serial.printf("[I2S] ERROR: PDM mic pin config failed: %d\n", err);
         return;
     }
 
-    Serial.printf("[I2S] Microphone configured: %dHz, %d-bit\n", SAMPLE_RATE, SAMPLE_BITS);
-    Serial.printf("[I2S] Pins: WS=%d, BCK=%d, DIN=%d\n", I2S_WS, I2S_BCK, I2S_DIN);
+    Serial.printf("[I2S] PDM Microphone configured: %dHz, 16-bit\n", SAMPLE_RATE);
+    Serial.printf("[I2S] PDM pins: CLK=%d, DATA=%d\n", I2S_MIC_BCK, I2S_MIC_DIN);
 }
 
 // =============================================================================
@@ -781,17 +806,17 @@ void setupI2SSpk() {
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 16,
-        .dma_buf_len = 1024,
-        .use_apll = false,  // Use default PLL
+        .dma_buf_count = 8,
+        .dma_buf_len = 256,
+        .use_apll = false,
         .tx_desc_auto_clear = true,
         .fixed_mclk = 0
     };
 
     i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_BCK,
-        .ws_io_num = I2S_WS,
-        .data_out_num = I2S_DOUT,
+        .bck_io_num = I2S_SPK_BCK,
+        .ws_io_num = I2S_SPK_WS,
+        .data_out_num = I2S_SPK_DOUT,
         .data_in_num = I2S_PIN_NO_CHANGE
     };
 
@@ -808,7 +833,21 @@ void setupI2SSpk() {
     }
 
     Serial.printf("[I2S] Speaker configured: %dHz, 32-bit stereo\n", SAMPLE_RATE_TTS);
-    Serial.printf("[I2S] Pins: WS=%d, BCK=%d, DOUT=%d\n", I2S_WS, I2S_BCK, I2S_DOUT);
+    Serial.printf("[I2S] Spk pins: BCK=%d, WS=%d, DOUT=%d\n", I2S_SPK_BCK, I2S_SPK_WS, I2S_SPK_DOUT);
+}
+
+// =============================================================================
+// Amp Control (NS4168 enable pin)
+// =============================================================================
+
+void setupAmpCtrl() {
+    pinMode(I2S_SPK_CTRL, OUTPUT);
+    digitalWrite(I2S_SPK_CTRL, LOW);  // Amp off at boot
+    Serial.printf("[AMP] Control pin GPIO %d (off)\n", I2S_SPK_CTRL);
+}
+
+void setAmpEnabled(bool on) {
+    digitalWrite(I2S_SPK_CTRL, on ? HIGH : LOW);
 }
 
 // =============================================================================
@@ -820,6 +859,8 @@ static int audioPacketCount = 0;
 void playbackTask(void* param) {
     int16_t playChunk[PLAYBACK_CHUNK_SIZE];
     int32_t stereoBuffer[PLAYBACK_CHUNK_SIZE * 2];
+    Serial.printf("[PLAY] Task started, stack high water mark: %d bytes free\n",
+                  uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
 
     while (true) {
         if (audioState == AUDIO_PLAYING) {
@@ -827,13 +868,17 @@ void playbackTask(void* param) {
 
             if (avail == 0) {
                 if (ringStreamEnded) {
-                    // Wait for I2S DMA to finish playing remaining buffered audio
-                    vTaskDelay(500 / portTICK_PERIOD_MS);
+                    // Flush: write silence to push remaining audio through DMA
+                    int32_t silence[256] = {0};
+                    size_t written;
+                    for (int i = 0; i < 4; i++) {
+                        i2s_write(I2S_PORT_SPK, silence, sizeof(silence), &written, portMAX_DELAY);
+                    }
+                    vTaskDelay(200 / portTICK_PERIOD_MS);
                     Serial.println("[AUDIO] Ring buffer drained, playback done");
                     Serial.printf("[AUDIO] Playback complete. %d packets received.\n", audioPacketCount);
                     audioState = AUDIO_IDLE;
-                    i2s_driver_uninstall(I2S_PORT_SPK);
-                    setupI2SMic();
+                    setAmpEnabled(false);
                     continue;
                 }
                 // Underrun - rebuffer
@@ -868,8 +913,7 @@ void playbackTask(void* param) {
             } else if (ringStreamEnded && avail == 0) {
                 Serial.println("[AUDIO] Stream ended with no audio");
                 audioState = AUDIO_IDLE;
-                i2s_driver_uninstall(I2S_PORT_SPK);
-                setupI2SMic();
+                setAmpEnabled(false);
             }
             vTaskDelay(5 / portTICK_PERIOD_MS);
 
@@ -881,8 +925,7 @@ void playbackTask(void* param) {
             } else if (ringStreamEnded && avail == 0) {
                 Serial.println("[AUDIO] Stream ended during rebuffer");
                 audioState = AUDIO_IDLE;
-                i2s_driver_uninstall(I2S_PORT_SPK);
-                setupI2SMic();
+                setAmpEnabled(false);
             }
             vTaskDelay(5 / portTICK_PERIOD_MS);
 
@@ -894,9 +937,11 @@ void playbackTask(void* param) {
 }
 
 void startPlaybackMode(Transport source) {
-    // Switch from mic to speaker I2S
-    i2s_driver_uninstall(I2S_PORT_MIC);
-    setupI2SSpk();
+    Serial.printf("[AUDIO] Free heap: %d, min ever: %d, PSRAM free: %d\n",
+                  ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram());
+    Serial.printf("[AUDIO] Playback task stack HWM: %d bytes\n",
+                  playbackTaskHandle ? uxTaskGetStackHighWaterMark(playbackTaskHandle) * sizeof(StackType_t) : -1);
+    setAmpEnabled(true);
 
     ringReset();
     audioPacketCount = 0;
@@ -959,22 +1004,24 @@ void updateAudioCapture() {
         return;
     }
 
-    // Read 32-bit audio data from I2S (INMP441 outputs 24-bit in 32-bit frame)
+    // Read 16-bit PCM directly from PDM mic (decimated by I2S hardware)
     size_t bytesRead = 0;
-    esp_err_t err = i2s_read(I2S_PORT_MIC, rawAudioBuffer,
-                             AUDIO_BUFFER_SIZE * sizeof(int32_t),
+    esp_err_t err = i2s_read(I2S_PORT_MIC, audioBuffer,
+                             AUDIO_BUFFER_SIZE * sizeof(int16_t),
                              &bytesRead, 10 / portTICK_PERIOD_MS);
 
     if (err == ESP_OK && bytesRead > 0) {
-        size_t samplesRead = bytesRead / sizeof(int32_t);
+        size_t samplesRead = bytesRead / sizeof(int16_t);
 
-        // Convert 32-bit to 16-bit (INMP441 data is in upper 24 bits, left-justified)
-        for (size_t i = 0; i < samplesRead; i++) {
-            int32_t sample = rawAudioBuffer[i] >> 14;  // Extract upper bits
-            sample = sample * MIC_GAIN;
-            if (sample > 32767) sample = 32767;
-            if (sample < -32768) sample = -32768;
-            audioBuffer[i] = (int16_t)sample;
+        // Debug: dump first few 16-bit samples every 500ms
+        static unsigned long lastRawPrint = 0;
+        if (now - lastRawPrint > 500) {
+            Serial.printf("[MIC-PDM] bytes=%d samples=%d | ", bytesRead, samplesRead);
+            for (int i = 0; i < min((size_t)8, samplesRead); i++) {
+                Serial.printf("%6d ", audioBuffer[i]);
+            }
+            Serial.println();
+            lastRawPrint = now;
         }
 
         // Calculate audio level for silence detection
@@ -1009,29 +1056,20 @@ void updateAudioCapture() {
 }
 
 void streamAudioPacket(int16_t* data, size_t samples) {
-    // Send audio packet with header: [0xAA][0x55][len_high][len_low][pcm_data...]
+    // Send audio packet via TCP only: [0xAA][0x55][len_high][len_low][pcm_data...]
+    if (!tcpClientConnected || !tcpWriteMutex) return;
+
     size_t dataBytes = samples * sizeof(int16_t);
-
-    // Always send mic audio via serial (mic capture is always serial-initiated for now)
-    Serial.write(AUDIO_HEADER_1);
-    Serial.write(AUDIO_HEADER_2);
-    Serial.write((uint8_t)(dataBytes >> 8));
-    Serial.write((uint8_t)(dataBytes & 0xFF));
-    Serial.write((uint8_t*)data, dataBytes);
-
-    // Also send via TCP if client connected (mutex-protected)
-    if (tcpClientConnected && tcpWriteMutex) {
-        if (xSemaphoreTake(tcpWriteMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            uint8_t header[4] = {
-                AUDIO_HEADER_1,
-                AUDIO_HEADER_2,
-                (uint8_t)(dataBytes >> 8),
-                (uint8_t)(dataBytes & 0xFF)
-            };
-            tcpClient.write(header, 4);
-            tcpClient.write((uint8_t*)data, dataBytes);
-            xSemaphoreGive(tcpWriteMutex);
-        }
+    if (xSemaphoreTake(tcpWriteMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        uint8_t header[4] = {
+            AUDIO_HEADER_1,
+            AUDIO_HEADER_2,
+            (uint8_t)(dataBytes >> 8),
+            (uint8_t)(dataBytes & 0xFF)
+        };
+        tcpClient.write(header, 4);
+        tcpClient.write((uint8_t*)data, dataBytes);
+        xSemaphoreGive(tcpWriteMutex);
     }
 }
 
@@ -1068,11 +1106,14 @@ void handleAudioInput(Stream& stream) {
         return;
     }
 
-    // Read audio data into temp buffer
+    // Read audio data in bulk (much faster than byte-by-byte)
     uint16_t bytesRead = 0;
     while (bytesRead < dataLen) {
-        if (stream.available()) {
-            ((uint8_t*)audioBuffer)[bytesRead++] = stream.read();
+        int avail = stream.available();
+        if (avail > 0) {
+            int toRead = min((int)(dataLen - bytesRead), avail);
+            int got = stream.readBytes(((uint8_t*)audioBuffer) + bytesRead, toRead);
+            bytesRead += got;
         } else if (millis() - start > 1000) {
             Serial.println("[AUDIO] Read timeout");
             return;
@@ -1097,43 +1138,7 @@ void handleAudioInput(Stream& stream) {
 // =============================================================================
 
 void handleSerialInput() {
-    // In playback mode via serial, handle audio packets
-    if (activeTransport == TRANSPORT_SERIAL &&
-        (audioState == AUDIO_BUFFERING || audioState == AUDIO_PLAYING || audioState == AUDIO_REBUFFERING)) {
-
-        while (Serial.available()) {
-            uint8_t b = Serial.peek();
-            if (b == AUDIO_HEADER_1) {
-                handleAudioInput(Serial);
-            } else if (b == '{') {
-                // Could be a JSON command (like play_stop) - parse it
-                char c = Serial.read();
-                serialBuffer[0] = c;
-                serialBufferIndex = 1;
-                // Read until newline
-                unsigned long start = millis();
-                while (millis() - start < 100) {
-                    if (Serial.available()) {
-                        c = Serial.read();
-                        if (c == '\n' || c == '\r') {
-                            serialBuffer[serialBufferIndex] = '\0';
-                            processCommand(serialBuffer, TRANSPORT_SERIAL);
-                            serialBufferIndex = 0;
-                            break;
-                        } else if (serialBufferIndex < SERIAL_BUFFER_SIZE - 1) {
-                            serialBuffer[serialBufferIndex++] = c;
-                        }
-                    }
-                }
-                serialBufferIndex = 0;
-            } else {
-                Serial.read();  // Skip non-audio, non-JSON bytes
-            }
-        }
-        return;
-    }
-
-    // Normal JSON command handling
+    // Serial is debug/command-only (no audio). Audio uses TCP exclusively.
     while (Serial.available()) {
         char c = Serial.read();
 
@@ -1241,8 +1246,7 @@ void processCommand(const char* json, Transport source) {
     else if (strcmp(cmd, "test_tone") == 0) {
         // Play alternating tones: beep-beep pattern
         Serial.println("[TEST] Playing beep pattern (low-high-low-high) 32-bit...");
-        i2s_driver_uninstall(I2S_PORT_MIC);
-        setupI2SSpk();
+        setAmpEnabled(true);
 
         int32_t toneBuffer[512];  // 32-bit stereo buffer (L, R, L, R, ...)
         size_t bytesWritten;
@@ -1272,8 +1276,7 @@ void processCommand(const char* json, Transport source) {
             }
         }
 
-        i2s_driver_uninstall(I2S_PORT_SPK);
-        setupI2SMic();
+        setAmpEnabled(false);
         sendResponse("{\"ok\":true,\"action\":\"test_complete\"}", source);
     }
     else {
@@ -1309,7 +1312,7 @@ void sendStatus(Transport source) {
 
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "{\"status\":\"ok\",\"version\":\"0.8\",\"emotion\":\"%s\",\"audio\":\"%s\",\"wifi\":\"%s\",\"ring_buf\":%d}",
+        "{\"status\":\"ok\",\"version\":\"0.9\",\"emotion\":\"%s\",\"audio\":\"%s\",\"wifi\":\"%s\",\"ring_buf\":%d}",
         emotionNames[currentEmotion],
         audioStateNames[audioState],
         wifiConnected ? "connected" : "disconnected",

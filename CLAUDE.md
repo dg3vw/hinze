@@ -1,20 +1,20 @@
 # Hinze Project Context
 
 ## Project Overview
-Interactive robot companion with ESP32-S3, featuring voice interaction via host PC (Whisper/Claude/Piper), emotional OLED eyes, head movement, and LED feedback. Supports WiFi TCP streaming for unlimited speech duration.
+Interactive robot companion with ESP32-S3 SPK board, featuring voice interaction via host PC (Whisper/Claude/Piper), emotional OLED eyes, and LED feedback. Dual I2S buses (mic + speaker run simultaneously). Supports WiFi TCP streaming for unlimited speech duration.
 
 ## Current State (2026-02-04)
 
 ### Completed
 - [x] Functional Specification Document (hinze_FSD.md)
 - [x] Hardware pin assignments finalized
-- [x] PlatformIO configuration for ESP32-S3 SuperMini
+- [x] PlatformIO configuration for ESP32-S3 SPK board
 - [x] GitHub repository created: https://github.com/dg3vw/hinze
 - [x] OLED eye animations - 10 unique emotion styles
-- [x] WS2812 LED - Rainbow cycle idle + emotion colors
-- [x] TTP223 touch sensor with debounce (GPIO 10)
+- [x] SK6812 LED - Rainbow cycle idle + emotion colors
+- [x] TTP223 touch sensor with debounce (GPIO 1)
 - [x] Idle behavior: random look-around + natural blink
-- [x] I2S microphone input (INMP441)
+- [x] I2S microphone input (MSM261D3526H1CPM, dual onboard)
 - [x] Serial JSON command parser
 - [x] Audio streaming protocol (binary packets)
 - [x] Python host application skeleton
@@ -33,13 +33,12 @@ Interactive robot companion with ESP32-S3, featuring voice interaction via host 
 ### Hardware Verified
 | Component | Status | Notes |
 |-----------|--------|-------|
-| ESP32-S3 SuperMini | Working | USB CDC on /dev/ttyACM0 or ACM1 |
-| SSD1306 OLED | Working | I2C 0x3C, animated eyes displayed |
-| WS2812 LED | Working | Rainbow cycle + emotion colors |
-| TTP223 Touch | Working | GPIO 10, active HIGH, triggers recording |
-| INMP441 Mic | **Working** | I2S 32-bit mode, 16kHz, levels 400-4500 |
-| MAX98357A Amp | **Working** | I2S 32-bit, 8kHz, streaming playback |
-| SG90 Servos | Pins set | GPIO 1 (pan), GPIO 2 (tilt), not yet integrated |
+| ESP32-S3 SPK Board | Working | USB CDC, 16MB flash, 8MB PSRAM |
+| SSD1306 OLED | Working | I2C 0x3C (SDA=13, SCL=14) |
+| SK6812 LED | Working | GPIO 21, rainbow cycle + emotion colors |
+| TTP223 Touch | Working | GPIO 1, active HIGH, triggers recording |
+| MSM261 Dual Mic | Pending | I2S_NUM_0 (BCK=38, WS=40, DIN=39), 16kHz |
+| NS4168 Amp | Pending | I2S_NUM_1 (BCK=10, WS=45, DOUT=9), CTRL=46 |
 
 ### End-to-End Test (2026-02-03)
 - ✅ Touch sensor triggers recording
@@ -53,11 +52,11 @@ Interactive robot companion with ESP32-S3, featuring voice interaction via host 
 - ✅ Full voice interaction loop complete!
 
 ### Firmware Version
-**v0.8** - RoboEyes Pure (no overlays)
+**v0.9** - ESP32-S3 SPK Board (dual I2S, PSRAM)
 
 ## Architecture
 ```
-Host PC (Python)                      ESP32-S3
+Host PC (Python)                      ESP32-S3 SPK Board
 ┌──────────────┐                ┌─────────────────────┐
 │ TCPHandler   │── TCP:8266 ──> │ Core 0: wifiNetTask │
 │ (or Serial   │                │   TCP server        │
@@ -65,17 +64,21 @@ Host PC (Python)                      ESP32-S3
 └──────────────┘                │                     │
                                 │ Core 1: loop()      │
                                 │   eyes/LED/buttons  │
-                                │   ring buf → I2S    │
+                                │                     │
+                                │ I2S_NUM_0: mic      │
+                                │ I2S_NUM_1: speaker  │
+                                │ (both always on)    │
                                 └─────────────────────┘
 ```
 
 ## Pin Reference (Quick)
 ```
-I2S:    DIN=4 (mic), WS=5, BCK=6, DOUT=7 (amp)
-I2C:    SDA=8, SCL=9
-Servo:  Pan=1, Tilt=2
-LED:    WS2812=48
-Touch:  TTP223=GPIO 10 (active HIGH)
+I2S Mic:  BCK=38, WS=40, DIN=39    (I2S_NUM_0, MSM261)
+I2S Spk:  BCK=10, WS=45, DOUT=9    (I2S_NUM_1, NS4168)
+Amp Ctrl: GPIO 46 (HIGH=on)
+I2C:      SDA=13, SCL=14
+LED:      SK6812=21
+Touch:    TTP223=GPIO 1 (active HIGH)
 ```
 
 ## Protocol (Serial + TCP)
@@ -110,11 +113,11 @@ Binary format: `[0xAA][0x55][len_high][len_low][pcm_data...]`
 
 ## Streaming Audio Architecture
 
-### Ring Buffer (replaces old 90KB static buffer)
-- 8,000 samples (16 KB) = 1 second at 8kHz
+### Ring Buffer (PSRAM allocated)
+- 16,000 samples (32 KB) = 2 seconds at 8kHz, allocated in PSRAM
 - Prefill: 0.5s (4,000 samples) before playback starts
 - Underrun recovery: rebuffer 0.25s then resume
-- Non-blocking: 256 samples per loop iteration
+- Dedicated playback task with blocking I2S writes
 
 ### Audio States
 | State | Description |
@@ -127,18 +130,18 @@ Binary format: `[0xAA][0x55][len_high][len_low][pcm_data...]`
 | AUDIO_REBUFFERING | Underrun recovery, waiting for refill |
 
 ### Playback Flow
-1. Host sends `play_start` → ESP32 switches to speaker I2S, enters BUFFERING
+1. Host sends `play_start` → ESP32 enables amp, enters BUFFERING
 2. Host streams audio packets → ESP32 writes to ring buffer
 3. Ring buffer reaches 0.5s prefill → transitions to PLAYING
-4. ESP32 feeds I2S from ring buffer each loop iteration (non-blocking)
+4. Playback task feeds I2S_NUM_1 with blocking writes (paces at 8kHz)
 5. Eyes/LED/buttons keep animating during playback (30 FPS)
 6. Host sends `play_stop` → sets stream-end marker
-7. ESP32 plays until ring buffer drains, then switches back to mic
+7. ESP32 plays until ring buffer drains, disables amp (mic stays on throughout)
 
-### Memory Budget
-- Old: 180 KB (play buffer) + no WiFi = ~200 KB
-- New: 16 KB (ring buffer) + ~60 KB (WiFi stack) = ~76 KB
-- Net savings: ~124 KB freed
+### Dual I2S Architecture
+- I2S_NUM_0 (mic) and I2S_NUM_1 (speaker) installed at boot, never uninstalled
+- No I2S switching needed — amp CTRL pin controls speaker power
+- Mic can capture during playback if needed (not currently used)
 
 ## WiFi Setup
 ```bash
@@ -186,7 +189,8 @@ All emotions use RoboEyes moods/sizes/positions exclusively (no custom overlays)
 9. ~~Test LLM integration~~ (done - Ollama/OpenRouter/Anthropic)
 10. ~~Add I2S amplifier audio playback~~ (done - Piper TTS to ESP32)
 11. ~~WiFi streaming audio~~ (done - TCP, ring buffer, unlimited duration)
-12. Add servo library and test head movement
+12. ~~Migrate to ESP32-S3 SPK board~~ (done - dual I2S, PSRAM, SK6812)
+13. Verify new hardware end-to-end (mic, speaker, OLED, LED, touch)
 
 ## Build Commands
 ```bash

@@ -12,7 +12,7 @@ config_local.py is ignored by git to protect your API keys.
 CONNECTION_MODE = "auto"
 
 # Serial settings
-SERIAL_PORT = "/dev/ttyACM0"  # Linux: /dev/ttyACM0 or /dev/ttyUSB0, Windows: COM3
+SERIAL_PORT = "/dev/ttyUSB0"  # Linux: /dev/ttyACM0 or /dev/ttyUSB0, Windows: COM3
 SERIAL_BAUD = 921600  # High speed for audio streaming
 
 # TCP/WiFi settings
