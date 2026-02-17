@@ -2,35 +2,44 @@
 
 ## 1. Overview
 
-Hinze is an interactive robot companion based on ESP32-S3, featuring voice interaction, emotional expressions, and head movement capabilities. The system uses a split architecture with the ESP32 handling hardware I/O and a host PC running AI processing (Whisper for speech recognition, multi-backend LLM for conversation, and Piper TTS for speech synthesis). Audio streaming uses WiFi TCP for unlimited speech duration.
+Hinze is an interactive mobile robot companion featuring voice interaction, vision, emotional expressions, and movement. The system uses a multi-controller architecture: an ESP32-S3 SPK board handles audio and display, an ESP32-CAM provides wireless camera streaming, and a Raspberry Pi Pico handles motion control. A host PC runs AI processing (Whisper STT, multi-backend LLM, Piper TTS) and communicates wirelessly via WiFi with the onboard controllers.
 
 ## 2. Hardware Components
 
-### 2.1 Main Controller
-- **ESP32-S3 SPK Board** - Custom board with 16MB flash, 8MB PSRAM, onboard mics and speaker amp, UART bridge (CH340/CP2102)
+### 2.1 Controllers
+| Controller | Role | Connection | Status |
+|------------|------|------------|--------|
+| **ESP32-S3 SPK Board** | Audio, display, LED, touch | WiFi TCP to host | **Working** |
+| **ESP32-CAM** | Camera streaming | WiFi MJPEG to host | Planned |
+| **Raspberry Pi Pico** | Motion control (servos, steppers, DC motors) | UART from ESP32 | Planned |
 
-### 2.2 Audio System
+### 2.2 ESP32-S3 SPK Board (Main Controller)
+- Custom board with 16MB flash, 8MB PSRAM, onboard mics and speaker amp
+- UART bridge (CH340/CP2102), appears as `/dev/ttyUSB0`
+
 | Component | Model | Interface | Purpose |
 |-----------|-------|-----------|---------|
-| Microphone (x2) | MSM261D3526H1CPM | PDM (I2S_NUM_0) | Voice command input (dual onboard) |
-| Amplifier | NS4168 | I2S (I2S_NUM_1) | Audio output/speech (onboard) |
-
-### 2.3 Visual Display
-| Component | Model | Interface | Purpose |
-|-----------|-------|-----------|---------|
+| Microphone (x2) | MSM261D3526H1CPM | PDM (I2S_NUM_0) | Voice input (dual onboard) |
+| Amplifier | NS4168 | I2S (I2S_NUM_1) | Audio output (onboard) |
 | OLED Display | 0.96" 128x64 SSD1306 | I2C | Emotion display (animated eyes) |
-| RGB LED | SK6812 (1x) | GPIO data | Emotion color indication |
-
-### 2.4 Motion System
-| Component | Model | Interface | Purpose |
-|-----------|-------|-----------|---------|
-| Servo Pan | SG90 | PWM | Head horizontal movement (not yet integrated) |
-| Servo Tilt | SG90 | PWM | Head vertical movement (not yet integrated) |
-
-### 2.5 User Input
-| Component | Model | Interface | Purpose |
-|-----------|-------|-----------|---------|
+| RGB LED | SK6812 (1x) | GPIO | Emotion color indication |
 | Touch Sensor | TTP223 | GPIO 1 (active HIGH) | Push-to-talk activation |
+
+### 2.3 ESP32-CAM (Vision Module, Planned)
+- Dedicated ESP32 with OV2640 camera module
+- Streams MJPEG over WiFi to host for vision-LLM processing
+- Separate from main controller to avoid GPIO/memory conflicts
+
+### 2.4 Raspberry Pi Pico (Motion Controller, Planned)
+- Connected to ESP32 SPK board via UART
+- PIO state machines for precise stepper pulse generation
+- Controls all actuators:
+
+| Actuator | Type | Purpose |
+|----------|------|---------|
+| Servo (x2) | SG90 | Head pan/tilt |
+| Stepper (xN) | NEMA17 (e.g. from 3D printer) | Robot arm joints |
+| DC Motor (x2) | Geared + H-bridge | Tracked chassis drive |
 
 ## 3. Pin Assignment (ESP32-S3 SPK Board)
 
@@ -83,22 +92,31 @@ Hinze is an interactive robot companion based on ESP32-S3, featuring voice inter
 
 ### 5.1 System Overview
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Host PC (Python)                      │
-├─────────────────┬─────────────────┬─────────────────────┤
-│ Whisper (local) │ LLM (multi-     │   Piper TTS (local) │
-│ Speech-to-Text  │ backend)        │   Text-to-Speech    │
-└────────┬────────┴────────┬────────┴──────────┬──────────┘
-         │                 │                    │
-         └────────────────┬┴───────────────────┘
-                          │ WiFi TCP / Serial (debug)
-┌─────────────────────────┴───────────────────────────────┐
-│              ESP32-S3 SPK Board (Arduino)               │
-├───────────┬───────────┬───────────┬─────────────────────┤
-│ MSM261    │ NS4168    │ SSD1306   │ SK6812              │
-│ PDM Mics  │ Speaker   │ Eyes      │ LED                 │
-│ (I2S_0)   │ (I2S_1)   │ (I2C)    │ (GPIO)              │
-└───────────┴───────────┴───────────┴─────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                      Host PC (Python)                        │
+├──────────────┬──────────────┬──────────────┬─────────────────┤
+│ Whisper STT  │ LLM (multi-  │ Piper TTS    │ Vision (planned)│
+│ (local)      │ backend)     │ (local)      │ (Vision-LLM)    │
+└──────┬───────┴──────┬───────┴──────┬───────┴────────┬────────┘
+       │              │              │                │
+       └──────────────┼──────────────┘                │
+                      │ WiFi TCP                      │ WiFi MJPEG
+                      │                               │
+┌─────────────────────┴────────────────┐  ┌───────────┴──────────┐
+│      ESP32-S3 SPK Board (Main)       │  │    ESP32-CAM          │
+├──────────┬──────────┬────────────────┤  │    (Planned)          │
+│ MSM261   │ NS4168   │ SSD1306+SK6812 │  │    OV2640 Camera      │
+│ PDM Mics │ Speaker  │ Eyes + LED     │  └────────────────────────┘
+│ (I2S_0)  │ (I2S_1)  │ (I2C + GPIO)  │
+└──────────┴──────────┴───────┬────────┘
+                              │ UART
+                    ┌─────────┴──────────────────┐
+                    │   Raspberry Pi Pico         │
+                    │   (Planned)                 │
+                    ├─────────┬─────────┬─────────┤
+                    │ Servos  │Steppers │DC Motors│
+                    │ (Head)  │ (Arm)   │(Chassis)│
+                    └─────────┴─────────┴─────────┘
 ```
 
 ### 5.2 Dual-Core Architecture
@@ -128,6 +146,7 @@ Core 1: loop() (Arduino, priority 1)
 - **Amp Control**: NS4168 enable pin (GPIO 46) — amp on only during playback
 - **WiFi**: STA mode, TCP server on port 8266, FreeRTOS task on core 0
 - **Serial**: UART0 via bridge chip, 115200 baud, debug output + JSON commands only
+- **Motion relay** (planned): Forward motion commands from host to Pi Pico via UART
 
 ### 5.4 Host Application (Python)
 | Component | Technology | Purpose |
@@ -145,15 +164,26 @@ Core 1: loop() (Arduino, priority 1)
 | **DeepSeek** | `LLM_BACKEND = "deepseek"` | Very affordable, fast responses |
 | **Anthropic** | `LLM_BACKEND = "anthropic"` | Claude API, needs credits |
 
-### 5.6 Data Flow
+### 5.6 Data Flow (Voice Interaction)
 1. User touches sensor → ESP32 starts recording
 2. MSM261 PDM mic captures audio → ESP32 streams 16kHz PCM to Host via TCP
 3. Whisper transcribes speech to text (German/English)
-4. LLM processes query, returns response + emotion tag (e.g., `[happy]`)
+4. LLM processes query (+ optional camera image), returns response + emotion tag
 5. Piper TTS generates audio chunks (22kHz) → resampled to 8kHz in real-time
-6. Host streams: emotion command + audio packets to ESP32 via TCP
+6. Host streams: emotion command + audio packets + motion commands to ESP32 via TCP
 7. ESP32 fills ring buffer (PSRAM), starts playback after 0.5s prefill
 8. NS4168 amp enabled, I2S_NUM_1 plays audio while eyes/LED continue animating
+9. ESP32 forwards motion commands to Pi Pico via UART (planned)
+
+### 5.7 Inter-Controller Communication (Planned)
+
+| Link | Protocol | Direction | Purpose |
+|------|----------|-----------|---------|
+| Host ↔ ESP32 SPK | WiFi TCP (port 8266) | Bidirectional | Audio, commands, events |
+| Host ← ESP32-CAM | WiFi HTTP/MJPEG | Unidirectional | Camera frames for vision-LLM |
+| ESP32 SPK → Pi Pico | UART (3.3V) | Bidirectional | Motion commands + status feedback |
+
+**UART Protocol (ESP32 ↔ Pico)**: Simple JSON or binary command format. ESP32 acts as relay between host TCP and Pico UART. Pico can send back status asynchronously (endstops, encoder positions, stall detection).
 
 ## 6. Activation Modes
 
@@ -201,13 +231,20 @@ Core 1: loop() (Arduino, priority 1)
 - [x] Frame-based animation at ~30 FPS
 - [x] Button input triggers recording (GPIO 1)
 
-### 7.3 Head Movement
-- [ ] Pan servo control (left/right, 0-180°)
-- [ ] Tilt servo control (up/down, 0-180°)
-- [ ] Synchronized movement with emotion states
-- [ ] Smooth motion interpolation
+### 7.3 Motion Control (Pi Pico)
+- [ ] UART communication protocol (ESP32 ↔ Pico)
+- [ ] Head pan/tilt servo control (SG90)
+- [ ] Synchronized head movement with emotion states
+- [ ] Stepper motor support for robot arm (e.g. repurposed 3D printer)
+- [ ] DC motor support for tracked chassis
+- [ ] Endstop/encoder feedback to host
 
-### 7.4 Host Communication
+### 7.4 Vision (ESP32-CAM)
+- [ ] MJPEG stream over WiFi
+- [ ] Host captures frames for vision-LLM queries
+- [ ] Object/face recognition via multimodal LLM
+
+### 7.5 Host Communication
 - [x] Serial debug/command interface (JSON, 115200 baud)
 - [x] WiFi TCP audio streaming (port 8266)
 - [x] Transport abstraction (serial/TCP auto-detection)
@@ -216,6 +253,8 @@ Core 1: loop() (Arduino, priority 1)
 - [x] Status reporting
 - [x] Event notifications (button, audio start/end)
 - [x] Streaming playback via ring buffer (PSRAM)
+- [ ] ESP32-CAM MJPEG integration (planned)
+- [ ] Motion command relay to Pi Pico (planned)
 
 ## 8. OLED Eye Graphics
 
@@ -328,8 +367,11 @@ Binary audio packets (same format in both directions):
 
 ### 10.6 Future Commands (Not Yet Implemented)
 ```json
-{"cmd": "servo", "pan": 90, "tilt": 45}   // Head movement
-{"cmd": "led", "r": 0, "g": 255, "b": 0}  // Manual LED control
+{"cmd": "servo", "pan": 90, "tilt": 45}        // Head movement (via Pico)
+{"cmd": "move", "left": 100, "right": 100}      // Tracked chassis (via Pico, -255..255)
+{"cmd": "arm", "joint": 0, "angle": 45}         // Arm joint (via Pico)
+{"cmd": "led", "r": 0, "g": 255, "b": 0}        // Manual LED control
+{"cmd": "camera", "action": "snapshot"}          // Request camera frame (via ESP32-CAM)
 ```
 
 ## 11. Development & Debugging
@@ -486,6 +528,6 @@ The LLM is configured with a personality prompt that instructs it to:
 - End every response with an emotion tag: `[happy]`, `[sad]`, etc.
 
 ---
-*Document Version: 2.0*
+*Document Version: 2.1*
 *Created: 2026-01-31*
 *Last Updated: 2026-02-17*
